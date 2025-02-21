@@ -18,6 +18,7 @@ import time
 import socket
 from botocore.config import Config
 import tempfile
+import json
 
 # AWS Configuration
 # Use environment variables for AWS credentials
@@ -96,10 +97,6 @@ def load_data_cached(metric):
             columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
             metric_columns = columns_df['name'].tolist()
             
-            # Create dtype dictionary only for existing columns
-            dtype_dict = {col: 'float32' for col in metric_columns 
-                         if any(ch in col for ch in CHANNELS)}
-            
             # Read only necessary columns
             df = pd.read_sql(
                 'SELECT id, time FROM main_data',
@@ -110,18 +107,30 @@ def load_data_cached(metric):
             # Read RPM data
             df_rpm = pd.read_sql(
                 'SELECT id, ch1s1 FROM rpm',
-                conn,
-                dtype={'ch1s1': 'float32'}
+                conn
             )
             
-            # Read metric data with specific dtypes
-            df1 = pd.read_sql(
-                f'SELECT * FROM {metric}',
-                conn,
-                dtype=dtype_dict
-            )
+            # Read metric data without type casting first
+            df1 = pd.read_sql(f'SELECT * FROM {metric}', conn)
             
-            # Merge with minimal memory usage
+            # Process JSON columns and convert to float where possible
+            for col in df1.columns:
+                if col != 'id' and any(ch in col for ch in CHANNELS):
+                    try:
+                        # Try direct float conversion first
+                        df1[col] = pd.to_numeric(df1[col], errors='raise')
+                    except ValueError:
+                        try:
+                            # If that fails, try to extract 'magnitude' from JSON
+                            df1[col] = df1[col].apply(lambda x: json.loads(x)['magnitude'] 
+                                                    if isinstance(x, str) and x.startswith('{') 
+                                                    else x)
+                            df1[col] = pd.to_numeric(df1[col], errors='coerce')
+                        except:
+                            print(f"Warning: Could not process column {col}")
+                            df1[col] = np.nan
+            
+            # Merge dataframes
             merged_df1 = pd.merge(
                 df[['id', 'time']], 
                 df1, 
@@ -135,7 +144,9 @@ def load_data_cached(metric):
                 how='inner'
             )
             
-            # Clear memory
+            # Convert RPM column to float
+            merged_df2['ch1s1'] = pd.to_numeric(merged_df2['ch1s1'], errors='coerce')
+            
             del df, df1, df_rpm
             
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
