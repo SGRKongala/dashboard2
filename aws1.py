@@ -17,6 +17,7 @@ from functools import lru_cache
 import time
 import socket
 from botocore.config import Config
+import tempfile
 
 # AWS Configuration
 # Use environment variables for AWS credentials
@@ -58,6 +59,7 @@ app = dash.Dash(
     server=server,
     url_base_pathname='/'  # Root path
 )
+server = app.server  # This line is important for gunicorn
 
 # Constants
 AVAILABLE_METRICS = ['std_dev', 'rms', 'iqr', 'clean_max', 'clean_min', 'clean_range', 
