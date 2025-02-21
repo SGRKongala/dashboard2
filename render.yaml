@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: sensor-dashboard
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn aws1:server --timeout 120 --workers 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.0
+      - key: MALLOC_TRIM_THRESHOLD_
+        value: 100000
+      - key: PYTHONUNBUFFERED
+        value: 1
+      - key: AWS_ACCESS_KEY
+        sync: false
+      - key: AWS_SECRET_KEY
+        sync: false
+    autoDeploy: false
+    plan: starter 
