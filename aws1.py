@@ -70,33 +70,36 @@ CHANNELS = ['ch1', 'ch2', 'ch3']
 COLORS = {'ch1': 'blue', 'ch2': 'red', 'ch3': 'green'}
 
 # Add caching decorator to load_data function
-@lru_cache(maxsize=1)  # Reduce cache size
+@lru_cache(maxsize=1)
 def load_data_cached(metric):
     temp_file = None
     try:
         start_time = time.time()
         print(f"Starting data load for {metric}...")
         
-        # Get the object from S3
+        # Get the object from S3 and save to temp file
         response = s3.get_object(Bucket=BUCKET_NAME, Key=S3_OBJECT_NAME)
-        
-        # Create a temporary file
         temp_file = tempfile.NamedTemporaryFile(delete=False, mode='wb')
         
-        # Download with minimal memory usage
         chunk_size = 16 * 1024 * 1024  # 16MB chunks
         stream = response['Body']
-        
         while True:
             chunk = stream.read(chunk_size)
             if not chunk:
                 break
             temp_file.write(chunk)
-            
         temp_file.close()
         
         # Create connection and read data efficiently
         with sqlite3.connect(temp_file.name) as conn:
+            # First, get the column names from the metric table
+            columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
+            metric_columns = columns_df['name'].tolist()
+            
+            # Create dtype dictionary only for existing columns
+            dtype_dict = {col: 'float32' for col in metric_columns 
+                         if any(ch in col for ch in CHANNELS)}
+            
             # Read only necessary columns
             df = pd.read_sql(
                 'SELECT id, time FROM main_data',
@@ -112,7 +115,6 @@ def load_data_cached(metric):
             )
             
             # Read metric data with specific dtypes
-            dtype_dict = {col: 'float32' for col in CHANNELS}
             df1 = pd.read_sql(
                 f'SELECT * FROM {metric}',
                 conn,
