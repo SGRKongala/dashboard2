@@ -394,7 +394,7 @@ def find_free_port(start_port=8050, max_port=8070):
 
 if __name__ == "__main__":
     try:
-        print("Starting Sensor Analysis Dashboard on port 8050")
-        app.run_server(debug=False, host='0.0.0.0', port=8050)
+        port = int(os.environ.get("PORT", 8050))
+        app.run_server(debug=False, host='0.0.0.0', port=port)
     except Exception as e:
         print(f"Failed to start server: {str(e)}")
