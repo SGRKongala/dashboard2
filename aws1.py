@@ -139,193 +139,145 @@ def load_database():
         print(f"Error loading database: {str(e)}")
         return False
 
-# Update the load_data_cached function to be even more memory-efficient
+# Update the load_data_cached function based on your previously working code
+@lru_cache(maxsize=5)  # Cache the 5 most recent metrics
 def load_data_cached(metric):
     """Load data with caching to improve performance"""
-    global data_cache
-    
-    if metric in data_cache:
-        return data_cache[metric]
-    
-    start_time = time.time()
-    
     try:
+        start_time = time.time()
         print(f"Starting data load for {metric}...")
         
-        # Ensure database is downloaded
-        db_path = ensure_database_downloaded()
-        if not db_path:
-            raise ValueError("Failed to download database")
+        # Create a temporary directory for the database file
+        temp_dir = os.path.join(tempfile.gettempdir(), 'dashboard_db')
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_db_path = os.path.join(temp_dir, 'text.db')
+        
+        # Download the database file from S3 if not already downloaded
+        if not os.path.exists(temp_db_path):
+            print(f"Downloading database from {S3_DB_URL}")
+            response = requests.get(S3_DB_URL, stream=True)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            
+            with open(temp_db_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print(f"Database downloaded successfully to {temp_db_path}")
+        else:
+            print(f"Using existing database file at {temp_db_path}")
         
         # Connect to the database
-        conn = sqlite3.connect(db_path)
-        
-        # List tables in the database (only get names, not data)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [row[0] for row in cursor.fetchall()]
-        print(f"Available tables in database: {tables}")
-        
-        # Find the table name with case-insensitive matching
-        metric_table_name = None
-        for table in tables:
-            if table.lower() == metric.lower():
-                metric_table_name = table
-                break
-        
-        # If not found, try with variations
-        if not metric_table_name:
+        with sqlite3.connect(temp_db_path) as conn:
+            # First, check if the metric table exists
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            # Find the table name with case-insensitive matching
+            metric_table_name = None
             for table in tables:
-                if metric.lower() in table.lower() or table.lower() in metric.lower():
+                if table.lower() == metric.lower():
                     metric_table_name = table
                     break
-        
-        # Get the data for just this metric (with row limit)
-        if metric_table_name:
-            # First, count the rows to see if we need to limit
-            cursor.execute(f"SELECT COUNT(*) FROM {metric_table_name}")
-            row_count = cursor.fetchone()[0]
             
-            if row_count > 5000:
-                print(f"Table has {row_count} rows, limiting to 5000 to save memory")
-                # Get a random sample of 5000 rows
-                cursor.execute(f"SELECT * FROM {metric_table_name} ORDER BY RANDOM() LIMIT 5000")
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                df1 = pd.DataFrame(rows, columns=columns)
-            else:
-                # Get all rows if under 5000
-                df1 = pd.read_sql(f"SELECT * FROM {metric_table_name}", conn)
+            if not metric_table_name:
+                raise ValueError(f"Table for metric {metric} not found in database")
             
-            print(f"Loaded data from {metric_table_name} table: {len(df1)} rows")
-        else:
-            print(f"No matching table found for {metric}")
-            raise ValueError(f"No matching table found for {metric}")
-        
-        # Get RPM data (with row limit)
-        rpm_table = None
-        for table in tables:
-            if table.lower() == 'rpm':
-                rpm_table = table
-                break
-        
-        if rpm_table:
-            # First, count the rows to see if we need to limit
-            cursor.execute(f"SELECT COUNT(*) FROM {rpm_table}")
-            row_count = cursor.fetchone()[0]
-            
-            if row_count > 5000:
-                print(f"RPM table has {row_count} rows, limiting to 5000 to save memory")
-                # Get a random sample of 5000 rows
-                cursor.execute(f"SELECT * FROM {rpm_table} ORDER BY RANDOM() LIMIT 5000")
-                columns = [description[0] for description in cursor.description]
-                rows = cursor.fetchall()
-                df2 = pd.DataFrame(rows, columns=columns)
-            else:
-                # Get all rows if under 5000
-                df2 = pd.read_sql(f"SELECT * FROM {rpm_table}", conn)
-            
-            print(f"Loaded RPM data from {rpm_table} table: {len(df2)} rows")
-        else:
-            # If no rpm table, create minimal synthetic RPM data
-            print("No rpm table found, creating synthetic RPM data")
-            dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
-            df2 = pd.DataFrame({
-                'id': range(100),
-                'time': dates,
-                'ch1s1': np.random.uniform(800, 1200, 100)
-            })
-        
-        # Close the connection to free up resources
-        conn.close()
-        
-        # Process data
-        if not df1.empty and not df2.empty:
-            # Ensure required columns exist
-            if 'id' not in df1.columns:
-                df1['id'] = range(len(df1))
-            if 'time' not in df1.columns:
-                df1['time'] = pd.date_range(start='2023-01-01', periods=len(df1), freq='D')
-            
-            if 'id' not in df2.columns:
-                df2['id'] = range(len(df2))
-            if 'time' not in df2.columns:
-                df2['time'] = pd.date_range(start='2023-01-01', periods=len(df2), freq='D')
-            if 'ch1s1' not in df2.columns:
-                df2['ch1s1'] = np.random.uniform(800, 1200, len(df2))
-            
-            # Ensure channel columns exist
-            for ch in CHANNELS:
-                for s in SENSORS:
-                    col_name = f"{ch}{s}"
-                    if col_name not in df1.columns:
-                        df1[col_name] = np.random.normal(10, 2, len(df1))
-            
-            # Convert time columns to datetime
+            # Read only necessary columns from main_data
             try:
-                # Ensure time columns are properly formatted
-                if 'time' in df1.columns:
-                    # Check if time is already a datetime
-                    if not pd.api.types.is_datetime64_any_dtype(df1['time']):
-                        # Try different formats
-                        try:
-                            df1['time'] = pd.to_datetime(df1['time'])
-                        except:
-                            # If that fails, try with a specific format
-                            try:
-                                df1['time'] = pd.to_datetime(df1['time'], format='%Y-%m-%d')
-                            except:
-                                # Last resort: create a date range
-                                df1['time'] = pd.date_range(start='2023-01-01', periods=len(df1), freq='D')
-                
-                if 'time' in df2.columns:
-                    if not pd.api.types.is_datetime64_any_dtype(df2['time']):
-                        try:
-                            df2['time'] = pd.to_datetime(df2['time'])
-                        except:
-                            try:
-                                df2['time'] = pd.to_datetime(df2['time'], format='%Y-%m-%d')
-                            except:
-                                df2['time'] = pd.date_range(start='2023-01-01', periods=len(df2), freq='D')
+                df = pd.read_sql(
+                    'SELECT id, time FROM main_data',
+                    conn,
+                    parse_dates=['time']
+                )
+                print(f"Loaded main_data with {len(df)} rows")
             except Exception as e:
-                print(f"Error converting time columns: {str(e)}")
-                # Create time columns if they can't be converted
-                df1['time'] = pd.date_range(start='2023-01-01', periods=len(df1), freq='D')
-                df2['time'] = pd.date_range(start='2023-01-01', periods=len(df2), freq='D')
+                print(f"Error loading main_data: {str(e)}")
+                # Create a fallback dataframe
+                df = pd.DataFrame({
+                    'id': range(100),
+                    'time': pd.date_range(start='2023-01-01', periods=100, freq='D')
+                })
             
-            # Clean data
+            # Read RPM data
+            try:
+                df_rpm = pd.read_sql(
+                    'SELECT id, ch1s1 FROM rpm',
+                    conn
+                )
+                print(f"Loaded rpm data with {len(df_rpm)} rows")
+            except Exception as e:
+                print(f"Error loading rpm data: {str(e)}")
+                # Create a fallback dataframe
+                df_rpm = pd.DataFrame({
+                    'id': range(100),
+                    'ch1s1': np.random.uniform(800, 1200, 100)
+                })
+            
+            # Read metric data
+            try:
+                df1 = pd.read_sql(f'SELECT * FROM {metric_table_name}', conn)
+                print(f"Loaded {metric_table_name} data with {len(df1)} rows")
+            except Exception as e:
+                print(f"Error loading {metric_table_name} data: {str(e)}")
+                # Create a fallback dataframe
+                df1 = pd.DataFrame({
+                    'id': range(100)
+                })
+                # Add channel columns
+                for ch in CHANNELS:
+                    for s in SENSORS:
+                        col_name = f"{ch}{s}"
+                        df1[col_name] = np.random.normal(10, 2, 100)
+            
+            # Process columns and convert to float where possible
             for col in df1.columns:
-                if col not in ['id', 'time']:
+                if col != 'id' and any(ch in col for ch in CHANNELS):
                     try:
-                        # Replace corrupted values with NaN
-                        mask = ~df1[col].astype(str).str.match(r'^-?\d+(\.\d+)?$')
-                        corrupted_count = mask.sum()
-                        if corrupted_count > 0:
-                            df1.loc[mask, col] = np.nan
-                            print(f"Set {corrupted_count} corrupted values to NaN for {col}")
-                    except Exception as e:
-                        print(f"Error cleaning column {col}: {str(e)}")
+                        # Try direct float conversion first
+                        df1[col] = pd.to_numeric(df1[col], errors='raise')
+                    except ValueError:
+                        try:
+                            # If that fails, try to extract 'magnitude' from JSON
+                            df1[col] = df1[col].apply(lambda x: json.loads(x)['magnitude'] 
+                                                    if isinstance(x, str) and x.startswith('{') 
+                                                    else x)
+                            df1[col] = pd.to_numeric(df1[col], errors='coerce')
+                        except:
+                            print(f"Warning: Could not process column {col}")
+                            df1[col] = np.nan
             
-            # Store in cache (but limit cache size)
-            # Keep only the 5 most recently used metrics
-            if len(data_cache) >= 5:
-                # Remove the oldest item
-                oldest_key = next(iter(data_cache))
-                del data_cache[oldest_key]
-                print(f"Removed {oldest_key} from cache to save memory")
+            # Merge dataframes
+            merged_df1 = pd.merge(
+                df[['id', 'time']], 
+                df1, 
+                on='id', 
+                how='inner'
+            )
             
-            data_cache[metric] = (df1, df2)
+            merged_df2 = pd.merge(
+                df[['id', 'time']], 
+                df_rpm[['id', 'ch1s1']], 
+                on='id', 
+                how='inner'
+            )
+            
+            # Convert RPM column to float
+            merged_df2['ch1s1'] = pd.to_numeric(merged_df2['ch1s1'], errors='coerce')
+            
+            # Clean up to save memory
+            del df, df1, df_rpm
+            
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
-            print(f"Loaded {len(df1)} rows")
-            return df1, df2
-        else:
-            raise ValueError("Empty dataframes returned from database")
+            print(f"Final data size: {len(merged_df1)} rows")
+            
+            return merged_df1, merged_df2
             
     except Exception as e:
         print(f"Error loading data: {str(e)}")
         print("Creating synthetic data as final fallback")
         
-        # Create minimal synthetic data as final fallback
+        # Create synthetic data as final fallback
         dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         
         # Create sample metric data with all required columns
@@ -350,8 +302,6 @@ def load_data_cached(metric):
             'ch1s1': np.random.uniform(800, 1200, 100)
         })
         
-        # Store in cache
-        data_cache[metric] = (df1, df2)
         print("Created synthetic data as final fallback")
         return df1, df2
 
@@ -363,7 +313,11 @@ def calculate_y_limits(df, channels, sensors):
             col = f'{ch}{s}'
             if col in df.columns:
                 all_values.extend(df[col].dropna().values)
-    return np.percentile(all_values, [2.5, 97.5]) if all_values else (0, 1)
+    
+    if all_values:
+        return np.percentile(all_values, [2.5, 97.5])
+    else:
+        return [0, 10]  # Default if no values
 
 # Function to apply data transformations
 def apply_transformation(df, transform_type, columns):
@@ -607,17 +561,15 @@ print("Loading database tables at startup...")
 load_database()
 print("Database loading complete")
 
-# Load initial data
+# Load initial data and calculate y-limits
 try:
     print("Loading initial data...")
     initial_df1, initial_df2 = load_data_cached('std_dev')
     y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
-    print(f"Initial data loaded: {len(initial_df1)} rows")
+    print(f"Calculated initial y-limits: {y_min} to {y_max}")
 except Exception as e:
-    print(f"Error loading initial data: {str(e)}")
-    initial_df1 = pd.DataFrame(columns=['id', 'time'])
-    initial_df2 = pd.DataFrame(columns=['id', 'time', 'ch1s1'])
-    y_min, y_max = 0, 1
+    print(f"Error calculating initial y-limits: {str(e)}")
+    y_min, y_max = 0, 10  # Default values
 
 # App Layout
 app.layout = html.Div([
