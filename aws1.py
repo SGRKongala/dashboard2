@@ -139,7 +139,7 @@ def load_database():
         print(f"Error loading database: {str(e)}")
         return False
 
-# Update the load_data_cached function to use the preloaded tables
+# Update the load_data_cached function to be even more memory-efficient
 def load_data_cached(metric):
     """Load data with caching to improve performance"""
     global data_cache
@@ -152,61 +152,92 @@ def load_data_cached(metric):
     try:
         print(f"Starting data load for {metric}...")
         
-        # Load database tables if not already loaded
-        if not db_loaded:
-            success = load_database()
-            if not success:
-                raise ValueError("Failed to load database")
+        # Ensure database is downloaded
+        db_path = ensure_database_downloaded()
+        if not db_path:
+            raise ValueError("Failed to download database")
+        
+        # Connect to the database
+        conn = sqlite3.connect(db_path)
+        
+        # List tables in the database (only get names, not data)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        print(f"Available tables in database: {tables}")
         
         # Find the table name with case-insensitive matching
         metric_table_name = None
-        for table_name in all_tables.keys():
-            if table_name == metric.lower():
-                metric_table_name = table_name
+        for table in tables:
+            if table.lower() == metric.lower():
+                metric_table_name = table
                 break
         
         # If not found, try with variations
         if not metric_table_name:
-            for table_name in all_tables.keys():
-                if metric.lower() in table_name or table_name in metric.lower():
-                    metric_table_name = table_name
+            for table in tables:
+                if metric.lower() in table.lower() or table.lower() in metric.lower():
+                    metric_table_name = table
                     break
         
-        # Get the data
-        if metric_table_name and metric_table_name in all_tables:
-            df1 = all_tables[metric_table_name].copy()
-            print(f"Using data from table {metric_table_name}")
+        # Get the data for just this metric (with row limit)
+        if metric_table_name:
+            # First, count the rows to see if we need to limit
+            cursor.execute(f"SELECT COUNT(*) FROM {metric_table_name}")
+            row_count = cursor.fetchone()[0]
+            
+            if row_count > 5000:
+                print(f"Table has {row_count} rows, limiting to 5000 to save memory")
+                # Get a random sample of 5000 rows
+                cursor.execute(f"SELECT * FROM {metric_table_name} ORDER BY RANDOM() LIMIT 5000")
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                df1 = pd.DataFrame(rows, columns=columns)
+            else:
+                # Get all rows if under 5000
+                df1 = pd.read_sql(f"SELECT * FROM {metric_table_name}", conn)
+            
+            print(f"Loaded data from {metric_table_name} table: {len(df1)} rows")
         else:
             print(f"No matching table found for {metric}")
             raise ValueError(f"No matching table found for {metric}")
         
-        # Get RPM data
-        if 'rpm' in all_tables:
-            df2 = all_tables['rpm'].copy()
-            print("Using RPM data from rpm table")
-        else:
-            # If no rpm table, create one based on the first dataframe
-            print("No rpm table found, creating synthetic RPM data")
-            if 'id' in df1.columns and 'time' in df1.columns:
-                unique_ids = df1['id'].unique()
-                unique_times = df1['time'].unique()
-                
-                # Create a dataframe with unique id/time combinations
-                id_time_pairs = []
-                for id_val in unique_ids:
-                    for time_val in unique_times:
-                        id_time_pairs.append((id_val, time_val))
-                
-                df2 = pd.DataFrame(id_time_pairs, columns=['id', 'time'])
-                df2['ch1s1'] = np.random.uniform(800, 1200, len(df2))
+        # Get RPM data (with row limit)
+        rpm_table = None
+        for table in tables:
+            if table.lower() == 'rpm':
+                rpm_table = table
+                break
+        
+        if rpm_table:
+            # First, count the rows to see if we need to limit
+            cursor.execute(f"SELECT COUNT(*) FROM {rpm_table}")
+            row_count = cursor.fetchone()[0]
+            
+            if row_count > 5000:
+                print(f"RPM table has {row_count} rows, limiting to 5000 to save memory")
+                # Get a random sample of 5000 rows
+                cursor.execute(f"SELECT * FROM {rpm_table} ORDER BY RANDOM() LIMIT 5000")
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                df2 = pd.DataFrame(rows, columns=columns)
             else:
-                # If no id/time columns, create completely synthetic data
-                dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
-                df2 = pd.DataFrame({
-                    'id': range(100),
-                    'time': dates,
-                    'ch1s1': np.random.uniform(800, 1200, 100)
-                })
+                # Get all rows if under 5000
+                df2 = pd.read_sql(f"SELECT * FROM {rpm_table}", conn)
+            
+            print(f"Loaded RPM data from {rpm_table} table: {len(df2)} rows")
+        else:
+            # If no rpm table, create minimal synthetic RPM data
+            print("No rpm table found, creating synthetic RPM data")
+            dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
+            df2 = pd.DataFrame({
+                'id': range(100),
+                'time': dates,
+                'ch1s1': np.random.uniform(800, 1200, 100)
+            })
+        
+        # Close the connection to free up resources
+        conn.close()
         
         # Process data
         if not df1.empty and not df2.empty:
@@ -275,7 +306,14 @@ def load_data_cached(metric):
                     except Exception as e:
                         print(f"Error cleaning column {col}: {str(e)}")
             
-            # Store in cache
+            # Store in cache (but limit cache size)
+            # Keep only the 5 most recently used metrics
+            if len(data_cache) >= 5:
+                # Remove the oldest item
+                oldest_key = next(iter(data_cache))
+                del data_cache[oldest_key]
+                print(f"Removed {oldest_key} from cache to save memory")
+            
             data_cache[metric] = (df1, df2)
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
             print(f"Loaded {len(df1)} rows")
@@ -287,7 +325,7 @@ def load_data_cached(metric):
         print(f"Error loading data: {str(e)}")
         print("Creating synthetic data as final fallback")
         
-        # Create synthetic data as final fallback
+        # Create minimal synthetic data as final fallback
         dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         
         # Create sample metric data with all required columns
