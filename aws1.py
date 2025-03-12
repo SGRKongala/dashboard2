@@ -22,6 +22,9 @@ from flask import Flask
 import io
 import requests
 
+# Initialize data cache
+data_cache = {}
+
 # Constants
 AVAILABLE_METRICS = ['std_dev', 'rms', 'iqr', 'clean_max', 'clean_min', 'clean_range', 
                     'outlier_count', 'skewness', 'simpson', 'trapz', 'std_error']
