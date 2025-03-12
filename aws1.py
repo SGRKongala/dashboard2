@@ -24,6 +24,8 @@ import requests
 
 # Initialize data cache
 data_cache = {}
+db_loaded = False
+all_tables = {}
 
 # Constants
 AVAILABLE_METRICS = ['std_dev', 'rms', 'iqr', 'clean_max', 'clean_min', 'clean_range', 
@@ -79,8 +81,65 @@ except Exception as e:
     print(f"AWS Configuration Error: {str(e)}")
     s3 = None
 
-# Add caching decorator to load_data function
-@lru_cache(maxsize=1)
+# Function to load all tables from the database once
+def load_database():
+    """Load all tables from the database once"""
+    global db_loaded, all_tables
+    
+    if db_loaded:
+        return True
+    
+    start_time = time.time()
+    
+    try:
+        print("Loading database tables...")
+        
+        # Create a temporary directory for the database file
+        temp_dir = os.path.join(tempfile.gettempdir(), 'dashboard_db')
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_db_path = os.path.join(temp_dir, 'text.db')
+        
+        # Download the database file from S3 if not already downloaded
+        if not os.path.exists(temp_db_path):
+            print(f"Downloading database from {S3_DB_URL}")
+            response = requests.get(S3_DB_URL, stream=True)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            
+            with open(temp_db_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print(f"Database downloaded successfully to {temp_db_path}")
+        else:
+            print(f"Using existing database file at {temp_db_path}")
+        
+        # Connect to the database
+        conn = sqlite3.connect(temp_db_path)
+        
+        # List tables in the database
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        print(f"Available tables in database: {tables}")
+        
+        # Load all tables into memory
+        for table in tables:
+            try:
+                all_tables[table.lower()] = pd.read_sql(f"SELECT * FROM {table}", conn)
+                print(f"Loaded table {table} with {len(all_tables[table.lower()])} rows")
+            except Exception as e:
+                print(f"Error loading table {table}: {str(e)}")
+        
+        conn.close()
+        db_loaded = True
+        print(f"Database loading completed in {time.time() - start_time:.2f} seconds")
+        return True
+        
+    except Exception as e:
+        print(f"Error loading database: {str(e)}")
+        return False
+
+# Update the load_data_cached function to use the preloaded tables
 def load_data_cached(metric):
     """Load data with caching to improve performance"""
     global data_cache
@@ -93,124 +152,61 @@ def load_data_cached(metric):
     try:
         print(f"Starting data load for {metric}...")
         
-        # Create a temporary directory for the database file
-        temp_dir = os.path.join(tempfile.gettempdir(), 'dashboard_db')
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_db_path = os.path.join(temp_dir, 'text.db')
+        # Load database tables if not already loaded
+        if not db_loaded:
+            success = load_database()
+            if not success:
+                raise ValueError("Failed to load database")
         
-        # Download the database file from S3
-        try:
-            print(f"Downloading database from {S3_DB_URL}")
-            response = requests.get(S3_DB_URL, stream=True)
-            response.raise_for_status()  # Raise an exception for HTTP errors
-            
-            with open(temp_db_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            print(f"Database downloaded successfully to {temp_db_path}")
-            
-            # Connect to the database
-            conn = sqlite3.connect(temp_db_path)
-            
-            # List tables in the database
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in cursor.fetchall()]
-            print(f"Available tables in database: {tables}")
-            
-            # Find the table name with case-insensitive matching
-            table_name = None
-            for table in tables:
-                if table.lower() == metric.lower():
-                    table_name = table
+        # Find the table name with case-insensitive matching
+        metric_table_name = None
+        for table_name in all_tables.keys():
+            if table_name == metric.lower():
+                metric_table_name = table_name
+                break
+        
+        # If not found, try with variations
+        if not metric_table_name:
+            for table_name in all_tables.keys():
+                if metric.lower() in table_name or table_name in metric.lower():
+                    metric_table_name = table_name
                     break
-            
-            # If not found, try with underscore variations
-            if not table_name:
-                for table in tables:
-                    if table.lower().replace('_', '') == metric.lower().replace('_', ''):
-                        table_name = table
-                        break
-            
-            # If still not found, try with partial matching
-            if not table_name:
-                for table in tables:
-                    if metric.lower() in table.lower():
-                        table_name = table
-                        break
-            
-            if table_name:
-                df1 = pd.read_sql(f"SELECT * FROM {table_name}", conn)
-                print(f"Loaded data from {table_name} table")
+        
+        # Get the data
+        if metric_table_name and metric_table_name in all_tables:
+            df1 = all_tables[metric_table_name].copy()
+            print(f"Using data from table {metric_table_name}")
+        else:
+            print(f"No matching table found for {metric}")
+            raise ValueError(f"No matching table found for {metric}")
+        
+        # Get RPM data
+        if 'rpm' in all_tables:
+            df2 = all_tables['rpm'].copy()
+            print("Using RPM data from rpm table")
+        else:
+            # If no rpm table, create one based on the first dataframe
+            print("No rpm table found, creating synthetic RPM data")
+            if 'id' in df1.columns and 'time' in df1.columns:
+                unique_ids = df1['id'].unique()
+                unique_times = df1['time'].unique()
+                
+                # Create a dataframe with unique id/time combinations
+                id_time_pairs = []
+                for id_val in unique_ids:
+                    for time_val in unique_times:
+                        id_time_pairs.append((id_val, time_val))
+                
+                df2 = pd.DataFrame(id_time_pairs, columns=['id', 'time'])
+                df2['ch1s1'] = np.random.uniform(800, 1200, len(df2))
             else:
-                print(f"No matching table found for {metric}")
-                raise ValueError(f"No matching table found for {metric}")
-            
-            # Get RPM data
-            rpm_table = None
-            for table in tables:
-                if table.lower() == 'rpm':
-                    rpm_table = table
-                    break
-            
-            if rpm_table:
-                df2 = pd.read_sql(f"SELECT * FROM {rpm_table}", conn)
-                print(f"Loaded RPM data from {rpm_table} table")
-            else:
-                # If no rpm table, create one based on the first dataframe
-                print("No rpm table found, creating synthetic RPM data")
-                if 'id' in df1.columns and 'time' in df1.columns:
-                    unique_ids = df1['id'].unique()
-                    unique_times = df1['time'].unique()
-                    
-                    # Create a dataframe with unique id/time combinations
-                    id_time_pairs = []
-                    for id_val in unique_ids:
-                        for time_val in unique_times:
-                            id_time_pairs.append((id_val, time_val))
-                    
-                    df2 = pd.DataFrame(id_time_pairs, columns=['id', 'time'])
-                    df2['ch1s1'] = np.random.uniform(800, 1200, len(df2))
-                else:
-                    # If no id/time columns, create completely synthetic data
-                    dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
-                    df2 = pd.DataFrame({
-                        'id': range(100),
-                        'time': dates,
-                        'ch1s1': np.random.uniform(800, 1200, 100)
-                    })
-            
-            conn.close()
-            
-        except Exception as e:
-            print(f"Error accessing database from S3: {str(e)}")
-            print("Creating synthetic data as fallback")
-            
-            # Create synthetic data
-            dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
-            
-            # Create sample metric data
-            df1 = pd.DataFrame({
-                'id': range(100),
-                'time': dates
-            })
-            
-            # Add channel columns
-            for ch in CHANNELS:
-                for s in SENSORS:
-                    col_name = f"{ch}{s}"
-                    # Create some patterns in the data
-                    base = np.sin(np.linspace(0, 4*np.pi, 100)) * 5 + 10
-                    noise = np.random.normal(0, 1, 100)
-                    df1[col_name] = base + noise
-            
-            # Create sample RPM data
-            df2 = pd.DataFrame({
-                'id': range(100),
-                'time': dates,
-                'ch1s1': np.random.uniform(800, 1200, 100)
-            })
+                # If no id/time columns, create completely synthetic data
+                dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
+                df2 = pd.DataFrame({
+                    'id': range(100),
+                    'time': dates,
+                    'ch1s1': np.random.uniform(800, 1200, 100)
+                })
         
         # Process data
         if not df1.empty and not df2.empty:
@@ -545,6 +541,11 @@ app = dash.Dash(
     url_base_pathname='/'  # Root path
 )
 server = app.server  # This line is important for gunicorn
+
+# Load all database tables at startup
+print("Loading database tables at startup...")
+load_database()
+print("Database loading complete")
 
 # Load initial data
 try:
