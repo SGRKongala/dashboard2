@@ -20,6 +20,7 @@ import tempfile
 import socket
 from flask import Flask
 import io
+import requests
 
 # Constants
 AVAILABLE_METRICS = ['std_dev', 'rms', 'iqr', 'clean_max', 'clean_min', 'clean_range', 
@@ -51,10 +52,9 @@ TRANSFORMATIONS = [
 
 # AWS Configuration
 # Define your bucket name and S3 object details
-BUCKET_NAME = "public-tarucca-db"
-S3_OBJECT_NAME = "text.db"
-S3_REGION = "eu-central-1"
-LOCAL_FILE_PATH = "DB/text.db"  # Keep as fallback
+S3_BUCKET = 'public-tarucca-db'
+S3_REGION = 'eu-central-1'
+S3_DB_URL = f'https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/text.db'
 
 # Initialize S3 client
 s3 = None
@@ -70,7 +70,7 @@ try:
         )
     )
     # Test the connection by listing objects (should work for public buckets)
-    s3.list_objects_v2(Bucket=BUCKET_NAME, MaxKeys=1)
+    s3.list_objects_v2(Bucket=S3_BUCKET, MaxKeys=1)
     print("AWS S3 connection verified successfully")
 except Exception as e:
     print(f"AWS Configuration Error: {str(e)}")
@@ -79,137 +79,74 @@ except Exception as e:
 # Add caching decorator to load_data function
 @lru_cache(maxsize=1)
 def load_data_cached(metric):
-    temp_file = None
+    """Load data with caching to improve performance"""
+    global data_cache
+    
+    if metric in data_cache:
+        return data_cache[metric]
+    
+    start_time = time.time()
+    
     try:
-        start_time = time.time()
         print(f"Starting data load for {metric}...")
         
-        # Determine if we should use S3 or local file
-        use_s3 = s3 is not None
+        # Create a temporary directory for the database file
+        temp_dir = os.path.join(tempfile.gettempdir(), 'dashboard_db')
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_db_path = os.path.join(temp_dir, 'text.db')
         
-        if use_s3:
-            # Get the object from S3 and save to temp file
-            try:
-                print(f"Attempting to load data from S3 bucket: {BUCKET_NAME}")
-                response = s3.get_object(Bucket=BUCKET_NAME, Key=S3_OBJECT_NAME)
-                temp_file = tempfile.NamedTemporaryFile(delete=False, mode='wb')
-                
-                chunk_size = 16 * 1024 * 1024  # 16MB chunks
-                stream = response['Body']
-                while True:
-                    chunk = stream.read(chunk_size)
-                    if not chunk:
-                        break
-                    temp_file.write(chunk)
-                temp_file.close()
-                
-                db_path = temp_file.name
-                print(f"Successfully downloaded S3 object to temporary file")
-            except Exception as s3_error:
-                print(f"Error loading from S3: {str(s3_error)}, falling back to local file")
-                use_s3 = False
-                db_path = LOCAL_FILE_PATH
-        else:
-            db_path = LOCAL_FILE_PATH
-            print(f"Using local database file: {LOCAL_FILE_PATH}")
+        # Download the database file from S3
+        try:
+            print(f"Downloading database from {S3_DB_URL}")
+            response = requests.get(S3_DB_URL, stream=True)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            
+            with open(temp_db_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print(f"Database downloaded successfully to {temp_db_path}")
+            
+            # Load data from the downloaded database
+            conn = sqlite3.connect(temp_db_path)
+            df1 = pd.read_sql(f"SELECT * FROM {metric}_data", conn)
+            df2 = pd.read_sql("SELECT * FROM rpm_data", conn)
+            conn.close()
+            
+        except Exception as e:
+            print(f"Error accessing database from S3: {str(e)}")
+            # Return empty dataframes if we can't access the database
+            return pd.DataFrame(columns=['id', 'time']), pd.DataFrame(columns=['id', 'time', 'ch1s1'])
         
-        # Create connection and read data efficiently
-        with sqlite3.connect(db_path) as conn:
-            # First, get the column names from the metric table
-            columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
-            metric_columns = columns_df['name'].tolist()
+        # Process data
+        if not df1.empty and not df2.empty:
+            # Convert time columns to datetime
+            df1['time'] = pd.to_datetime(df1['time'])
+            df2['time'] = pd.to_datetime(df2['time'])
             
-            # Read only necessary columns
-            df = pd.read_sql(
-                'SELECT id, time FROM main_data',
-                conn,
-                parse_dates=['time']
-            )
-            
-            # Read RPM data
-            df_rpm = pd.read_sql(
-                'SELECT id, ch1s1 FROM rpm',
-                conn
-            )
-            
-            # Read metric data without type casting first
-            df1 = pd.read_sql(f'SELECT * FROM {metric}', conn)
-            
-            # Read corruption status data
-            try:
-                corruption_df = pd.read_sql(
-                    'SELECT * FROM corruption_status',
-                    conn
-                )
-                
-                # For each channel-sensor combination in the metric data
-                for col in df1.columns:
-                    if col != 'id' and any(ch in col for ch in CHANNELS):
-                        # If this column exists in corruption_status
-                        if col in corruption_df.columns:
-                            # Get IDs where this channel-sensor is corrupted
-                            corrupted_ids = corruption_df[corruption_df[col] == 1]['id'].tolist()
-                            
-                            # Set the corresponding values in the metric data to NaN
-                            df1.loc[df1['id'].isin(corrupted_ids), col] = np.nan
-                            
-                            print(f"Set {len(corrupted_ids)} corrupted values to NaN for {col}")
-                
-            except Exception as e:
-                print(f"Warning: Could not apply corruption filtering: {str(e)}")
-            
-            # Process JSON columns and convert to float where possible
+            # Clean data
             for col in df1.columns:
-                if col != 'id' and any(ch in col for ch in CHANNELS):
-                    try:
-                        # Try direct float conversion first
-                        df1[col] = pd.to_numeric(df1[col], errors='raise')
-                    except ValueError:
-                        try:
-                            # If that fails, try to extract 'magnitude' from JSON
-                            df1[col] = df1[col].apply(lambda x: json.loads(x)['magnitude'] 
-                                                    if isinstance(x, str) and x.startswith('{') 
-                                                    else x)
-                            df1[col] = pd.to_numeric(df1[col], errors='coerce')
-                        except:
-                            print(f"Warning: Could not process column {col}")
-                            df1[col] = np.nan
+                if col not in ['id', 'time']:
+                    # Replace corrupted values with NaN
+                    mask = ~df1[col].astype(str).str.match(r'^-?\d+(\.\d+)?$')
+                    corrupted_count = mask.sum()
+                    if corrupted_count > 0:
+                        df1.loc[mask, col] = np.nan
+                        print(f"Set {corrupted_count} corrupted values to NaN for {col}")
             
-            # Merge dataframes
-            merged_df1 = pd.merge(
-                df[['id', 'time']], 
-                df1, 
-                on='id', 
-                how='inner'
-            )
-            merged_df2 = pd.merge(
-                df[['id', 'time']], 
-                df_rpm[['id', 'ch1s1']], 
-                on='id', 
-                how='inner'
-            )
-            
-            # Convert RPM column to float
-            merged_df2['ch1s1'] = pd.to_numeric(merged_df2['ch1s1'], errors='coerce')
-            
-            del df, df1, df_rpm
-            
+            # Store in cache
+            data_cache[metric] = (df1, df2)
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
-            print(f"Loaded {len(merged_df1)} rows after filtering")
-            return merged_df1, merged_df2
+            print(f"Loaded {len(df1)} rows after filtering")
+            return df1, df2
+        else:
+            raise ValueError("Empty dataframes returned from database")
             
     except Exception as e:
-        error_source = "S3" if s3 is not None else "local database"
-        print(f"Error loading data from {error_source}: {str(e)}")
-        raise
-    finally:
-        # Clean up temp file if it exists
-        if temp_file and os.path.exists(temp_file.name):
-            try:
-                os.unlink(temp_file.name)
-            except Exception as cleanup_error:
-                print(f"Warning: Could not remove temporary file: {str(cleanup_error)}")
-    
+        print(f"Error loading data: {str(e)}")
+        # Return empty dataframes as fallback
+        return pd.DataFrame(columns=['id', 'time']), pd.DataFrame(columns=['id', 'time', 'ch1s1'])
+
 # Calculate default y-limits
 def calculate_y_limits(df, channels, sensors):
     all_values = []
