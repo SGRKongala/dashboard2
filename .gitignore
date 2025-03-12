@@ -1,0 +1,17 @@
+archive/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.env
+.venv
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+.ipynb_checkpoints/
+

@@ -1,7 +1,3 @@
-# Update imports
-import boto3
-import io
-from flask import Flask
 import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output, State
@@ -15,52 +11,15 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from functools import lru_cache
 import time
-import socket
+import json
+import math
+# Add new imports for AWS
+import boto3
 from botocore.config import Config
 import tempfile
-import json
-
-# AWS Configuration
-# Use environment variables for AWS credentials
-AWS_ACCESS_KEY = os.environ.get('AWS_ACCESS_KEY')
-AWS_SECRET_KEY = os.environ.get('AWS_SECRET_KEY')
-
-if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
-    raise ValueError("AWS credentials not found in environment variables")
-
-# Initialize S3 client with custom configuration
-try:
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        region_name='ap-southeast-2',
-        config=Config(
-            connect_timeout=5,
-            read_timeout=300,
-            retries={'max_attempts': 3}
-        )
-    )
-    # Test the connection
-    s3.list_buckets()
-    print("AWS credentials verified successfully")
-except Exception as e:
-    print(f"AWS Configuration Error: {str(e)}")
-    raise
-
-# Define your bucket name and local file details
-BUCKET_NAME = "mytaruccadb1"
-LOCAL_FILE_PATH = "DB/text.db"
-S3_OBJECT_NAME = "meta_data.db"
-
-# Initialize Flask and Dash
-server = Flask(__name__)
-app = dash.Dash(
-    __name__, 
-    server=server,
-    url_base_pathname='/'  # Root path
-)
-server = app.server  # This line is important for gunicorn
+import socket
+from flask import Flask
+import io
 
 # Constants
 AVAILABLE_METRICS = ['std_dev', 'rms', 'iqr', 'clean_max', 'clean_min', 'clean_range', 
@@ -70,6 +29,53 @@ BINS = np.arange(0, 18, 0.5)
 CHANNELS = ['ch1', 'ch2', 'ch3']
 COLORS = {'ch1': 'blue', 'ch2': 'red', 'ch3': 'green'}
 
+# Define comparison periods
+# Update the comparison periods
+COMPARISON_PERIODS = {
+    'Period A': ('2023-08-01', '2023-09-15'),
+    'Period B': ('2024-06-01', '2024-07-15'),
+    'Period C': ('2024-08-01', '2024-09-15'),
+    'Period D': ('2024-09-16', '2024-10-31'),
+    'Period E': ('2024-11-15', '2024-12-31')
+}
+
+# Available transformations
+TRANSFORMATIONS = [
+    {'label': 'None', 'value': 'none'},
+    {'label': 'Log', 'value': 'log'},
+    {'label': 'Z-Score', 'value': 'z_score'},
+    {'label': 'Min-Max (0-1)', 'value': 'min_max'},
+    {'label': 'Robust (IQR)', 'value': 'robust'},
+    {'label': 'Decimal Scale', 'value': 'decimal'}
+]
+
+# AWS Configuration
+# Define your bucket name and S3 object details
+BUCKET_NAME = "public-tarucca-db"
+S3_OBJECT_NAME = "text.db"
+S3_REGION = "eu-central-1"
+LOCAL_FILE_PATH = "DB/text.db"  # Keep as fallback
+
+# Initialize S3 client
+s3 = None
+try:
+    # Initialize S3 client without credentials for public bucket
+    s3 = boto3.client(
+        "s3",
+        region_name=S3_REGION,
+        config=Config(
+            connect_timeout=5,
+            read_timeout=300,
+            retries={'max_attempts': 3}
+        )
+    )
+    # Test the connection by listing objects (should work for public buckets)
+    s3.list_objects_v2(Bucket=BUCKET_NAME, MaxKeys=1)
+    print("AWS S3 connection verified successfully")
+except Exception as e:
+    print(f"AWS Configuration Error: {str(e)}")
+    s3 = None
+
 # Add caching decorator to load_data function
 @lru_cache(maxsize=1)
 def load_data_cached(metric):
@@ -78,21 +84,37 @@ def load_data_cached(metric):
         start_time = time.time()
         print(f"Starting data load for {metric}...")
         
-        # Get the object from S3 and save to temp file
-        response = s3.get_object(Bucket=BUCKET_NAME, Key=S3_OBJECT_NAME)
-        temp_file = tempfile.NamedTemporaryFile(delete=False, mode='wb')
+        # Determine if we should use S3 or local file
+        use_s3 = s3 is not None
         
-        chunk_size = 16 * 1024 * 1024  # 16MB chunks
-        stream = response['Body']
-        while True:
-            chunk = stream.read(chunk_size)
-            if not chunk:
-                break
-            temp_file.write(chunk)
-        temp_file.close()
+        if use_s3:
+            # Get the object from S3 and save to temp file
+            try:
+                print(f"Attempting to load data from S3 bucket: {BUCKET_NAME}")
+                response = s3.get_object(Bucket=BUCKET_NAME, Key=S3_OBJECT_NAME)
+                temp_file = tempfile.NamedTemporaryFile(delete=False, mode='wb')
+                
+                chunk_size = 16 * 1024 * 1024  # 16MB chunks
+                stream = response['Body']
+                while True:
+                    chunk = stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    temp_file.write(chunk)
+                temp_file.close()
+                
+                db_path = temp_file.name
+                print(f"Successfully downloaded S3 object to temporary file")
+            except Exception as s3_error:
+                print(f"Error loading from S3: {str(s3_error)}, falling back to local file")
+                use_s3 = False
+                db_path = LOCAL_FILE_PATH
+        else:
+            db_path = LOCAL_FILE_PATH
+            print(f"Using local database file: {LOCAL_FILE_PATH}")
         
         # Create connection and read data efficiently
-        with sqlite3.connect(temp_file.name) as conn:
+        with sqlite3.connect(db_path) as conn:
             # First, get the column names from the metric table
             columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
             metric_columns = columns_df['name'].tolist()
@@ -112,6 +134,29 @@ def load_data_cached(metric):
             
             # Read metric data without type casting first
             df1 = pd.read_sql(f'SELECT * FROM {metric}', conn)
+            
+            # Read corruption status data
+            try:
+                corruption_df = pd.read_sql(
+                    'SELECT * FROM corruption_status',
+                    conn
+                )
+                
+                # For each channel-sensor combination in the metric data
+                for col in df1.columns:
+                    if col != 'id' and any(ch in col for ch in CHANNELS):
+                        # If this column exists in corruption_status
+                        if col in corruption_df.columns:
+                            # Get IDs where this channel-sensor is corrupted
+                            corrupted_ids = corruption_df[corruption_df[col] == 1]['id'].tolist()
+                            
+                            # Set the corresponding values in the metric data to NaN
+                            df1.loc[df1['id'].isin(corrupted_ids), col] = np.nan
+                            
+                            print(f"Set {len(corrupted_ids)} corrupted values to NaN for {col}")
+                
+            except Exception as e:
+                print(f"Warning: Could not apply corruption filtering: {str(e)}")
             
             # Process JSON columns and convert to float where possible
             for col in df1.columns:
@@ -150,15 +195,21 @@ def load_data_cached(metric):
             del df, df1, df_rpm
             
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
+            print(f"Loaded {len(merged_df1)} rows after filtering")
             return merged_df1, merged_df2
             
     except Exception as e:
-        print(f"Error loading data from S3: {str(e)}")
+        error_source = "S3" if s3 is not None else "local database"
+        print(f"Error loading data from {error_source}: {str(e)}")
         raise
     finally:
+        # Clean up temp file if it exists
         if temp_file and os.path.exists(temp_file.name):
-            os.unlink(temp_file.name)
-
+            try:
+                os.unlink(temp_file.name)
+            except Exception as cleanup_error:
+                print(f"Warning: Could not remove temporary file: {str(cleanup_error)}")
+    
 # Calculate default y-limits
 def calculate_y_limits(df, channels, sensors):
     all_values = []
@@ -167,11 +218,256 @@ def calculate_y_limits(df, channels, sensors):
             col = f'{ch}{s}'
             if col in df.columns:
                 all_values.extend(df[col].dropna().values)
-    return np.percentile(all_values, [2.5, 97.5])
+    return np.percentile(all_values, [2.5, 97.5]) if all_values else (0, 1)
 
-# Load initial data and calculate y-limits
-initial_df1, initial_df2 = load_data_cached('std_dev')
-y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
+# Function to apply data transformations
+def apply_transformation(df, transform_type, columns):
+    """Apply the selected transformation to the specified columns"""
+    transformed_df = df.copy()
+    transform_description = "No Transformation"
+    
+    if transform_type != 'none':
+        for col in columns:
+            if col in transformed_df.columns:
+                # Apply the selected transformation
+                if transform_type == 'log':
+                    # Add a small constant to avoid log(0)
+                    min_val = transformed_df[col].min()
+                    offset = 0 if min_val > 0 else abs(min_val) + 1
+                    transformed_df[col] = np.log(transformed_df[col] + offset)
+                    transform_description = "Log Transformed"
+                
+                elif transform_type == 'z_score':
+                    mean = transformed_df[col].mean()
+                    std = transformed_df[col].std()
+                    if std > 0:  # Avoid division by zero
+                        transformed_df[col] = (transformed_df[col] - mean) / std
+                    transform_description = "Z-Score Normalized"
+                
+                elif transform_type == 'min_max':
+                    min_val = transformed_df[col].min()
+                    max_val = transformed_df[col].max()
+                    range_val = max_val - min_val
+                    if range_val > 0:  # Avoid division by zero
+                        transformed_df[col] = (transformed_df[col] - min_val) / range_val
+                    transform_description = "Min-Max Scaled (0-1)"
+                
+                elif transform_type == 'robust':
+                    median = transformed_df[col].median()
+                    q1 = transformed_df[col].quantile(0.25)
+                    q3 = transformed_df[col].quantile(0.75)
+                    iqr = q3 - q1
+                    if iqr > 0:  # Avoid division by zero
+                        transformed_df[col] = (transformed_df[col] - median) / iqr
+                    transform_description = "Robust Scaled (IQR)"
+                
+                elif transform_type == 'decimal':
+                    max_abs = max(abs(transformed_df[col].max()), abs(transformed_df[col].min()))
+                    if max_abs > 0:  # Avoid division by zero
+                        scale = 10 ** math.floor(math.log10(max_abs))
+                        transformed_df[col] = transformed_df[col] / scale
+                    transform_description = "Decimal Scaled"
+    
+    return transformed_df, transform_description
+
+def apply_baseline_adjustment(df, time_col='time'):
+    """Apply baseline adjustment between consecutive periods"""
+    adjusted_df = df.copy()
+    adjustments = {}
+    
+    try:
+        # Sort periods chronologically
+        sorted_periods = sorted(COMPARISON_PERIODS.items(), 
+                               key=lambda x: pd.to_datetime(x[1][0]))
+        
+        # Process each pair of consecutive periods
+        for i in range(len(sorted_periods) - 1):
+            current_period_name, current_period = sorted_periods[i]
+            next_period_name, next_period = sorted_periods[i+1]
+            
+            # Convert string dates to datetime objects
+            current_period_end = pd.to_datetime(current_period[1])
+            next_period_start = pd.to_datetime(next_period[0])
+            
+            print(f"Adjusting between {current_period_name} (ending {current_period[1]}) and {next_period_name} (starting {next_period[0]})")
+            
+            # Define date ranges for comparison (5 days before/after boundary)
+            current_end_range_start = current_period_end - pd.Timedelta(days=5)
+            next_start_range_end = next_period_start + pd.Timedelta(days=5)
+            
+            # Calculate adjustment factors for each column
+            for col in adjusted_df.columns:
+                # Skip time, id columns, and only process columns that contain channel names
+                if col in ['time', 'id'] or not any(ch in col for ch in CHANNELS):
+                    continue
+                
+                try:
+                    # Get data from end of current period
+                    current_end_mask = (adjusted_df[time_col] >= current_end_range_start) & (adjusted_df[time_col] <= current_period_end)
+                    current_end_data = adjusted_df.loc[current_end_mask, col].dropna()
+                    
+                    # Get data from start of next period
+                    next_start_mask = (adjusted_df[time_col] >= next_period_start) & (adjusted_df[time_col] <= next_start_range_end)
+                    next_start_data = adjusted_df.loc[next_start_mask, col].dropna()
+                    
+                    # Check if we have enough data points
+                    if len(current_end_data) < 3 or len(next_start_data) < 3:
+                        print(f"  Insufficient data for {col} at boundary between {current_period_name} and {next_period_name}")
+                        continue
+                    
+                    # Calculate means for both periods
+                    current_end_mean = current_end_data.mean()
+                    next_start_mean = next_start_data.mean()
+                    
+                    # Calculate adjustment (difference between means)
+                    adjustment = current_end_mean - next_start_mean
+                    
+                    # Only apply significant adjustments (more than 5% of data range)
+                    data_range = adjusted_df[col].max() - adjusted_df[col].min()
+                    if abs(adjustment) > 0.05 * data_range:
+                        # Apply adjustment to all data points in the next period and beyond
+                        future_mask = adjusted_df[time_col] >= next_period_start
+                        adjusted_df.loc[future_mask, col] = adjusted_df.loc[future_mask, col] + adjustment
+                        
+                        # Store the adjustment for reference
+                        adjustment_key = f"{current_period_name}-{next_period_name}_{col}"
+                        adjustments[adjustment_key] = adjustment
+                except Exception as e:
+                    print(f"  Error adjusting {col}: {str(e)}")
+                    continue
+        
+        print(f"Applied baseline adjustments: {adjustments}")
+        return adjusted_df, adjustments
+    
+    except Exception as e:
+        print(f"Error in baseline adjustment: {str(e)}")
+        return df, {}  # Return original data if adjustment fails
+
+def apply_data_transformation(df, transform_type):
+    """Apply various data transformations to the dataframe."""
+    # Create a copy to avoid modifying the original
+    transformed_df = df.copy()
+    transform_description = "No Transformation"
+    
+    # Get all sensor columns
+    sensor_cols = [col for col in df.columns if col not in ['id', 'time']]
+    
+    if transform_type != 'none':
+        for col in sensor_cols:
+            try:
+                # Skip columns with non-numeric data or all NaN values
+                if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().all():
+                    continue
+                    
+                # Apply the selected transformation
+                if transform_type == 'log':
+                    # Add a small constant to avoid log(0)
+                    min_val = transformed_df[col].min()
+                    offset = 0 if min_val > 0 else abs(min_val) + 1
+                    transformed_df[col] = np.log(transformed_df[col] + offset)
+                    transform_description = "Log Transformed"
+                
+                elif transform_type == 'z_score':
+                    mean = transformed_df[col].mean()
+                    std = transformed_df[col].std()
+                    if std > 0:  # Avoid division by zero
+                        transformed_df[col] = (transformed_df[col] - mean) / std
+                    transform_description = "Z-Score Normalized"
+                
+                elif transform_type == 'min_max':
+                    min_val = transformed_df[col].min()
+                    max_val = transformed_df[col].max()
+                    range_val = max_val - min_val
+                    if range_val > 0:  # Avoid division by zero
+                        transformed_df[col] = (transformed_df[col] - min_val) / range_val
+                    transform_description = "Min-Max Scaled (0-1)"
+                
+                elif transform_type == 'robust':
+                    median = transformed_df[col].median()
+                    q1 = transformed_df[col].quantile(0.25)
+                    q3 = transformed_df[col].quantile(0.75)
+                    iqr = q3 - q1
+                    if iqr > 0:  # Avoid division by zero
+                        transformed_df[col] = (transformed_df[col] - median) / iqr
+                    transform_description = "Robust Scaled (IQR)"
+                
+                elif transform_type == 'decimal':
+                    max_abs = max(abs(transformed_df[col].max()), abs(transformed_df[col].min()))
+                    if max_abs > 0:  # Avoid division by zero
+                        scale = 10 ** math.floor(math.log10(max_abs))
+                        transformed_df[col] = transformed_df[col] / scale
+                    transform_description = "Decimal Scaled"
+            except Exception as e:
+                print(f"Error transforming column {col}: {str(e)}")
+                # Keep the original values for this column
+                transformed_df[col] = df[col]
+    
+    return transformed_df, transform_description
+
+def apply_sigma_filter_and_smooth(df, column, sigma_threshold=2.0, window_size=7, poly_order=3):
+    """
+    Apply a sigma filter to remove outliers and then smooth the data with Savitzky-Golay
+    
+    Parameters:
+    -----------
+    df: DataFrame containing the data
+    column: Column name to process
+    sigma_threshold: Number of standard deviations to use for outlier detection
+    window_size: Window size for smoothing
+    poly_order: Polynomial order for Savitzky-Golay filter
+    
+    Returns:
+    --------
+    Tuple of (filtered_series, smoothed_series)
+    """
+    # Make a copy of the series
+    series = df[column].copy()
+    
+    # Apply sigma filter to remove outliers
+    mean = series.mean()
+    std = series.std()
+    lower_bound = mean - sigma_threshold * std
+    upper_bound = mean + sigma_threshold * std
+    
+    # Create a mask for values within bounds
+    mask = (series >= lower_bound) & (series <= upper_bound)
+    filtered_series = series.copy()
+    filtered_series[~mask] = np.nan  # Set outliers to NaN
+    
+    # Interpolate missing values
+    filtered_series = filtered_series.interpolate(method='linear')
+    
+    # Apply Savitzky-Golay filter for smoothing
+    try:
+        from scipy.signal import savgol_filter
+        smoothed_values = savgol_filter(filtered_series, window_size, poly_order)
+        smoothed_series = pd.Series(smoothed_values, index=filtered_series.index)
+    except:
+        # Fallback to simple moving average if scipy is not available
+        smoothed_series = filtered_series.rolling(window=window_size, center=True, min_periods=1).mean()
+    
+    return filtered_series, smoothed_series
+
+# Initialize Dash app with Flask server
+server = Flask(__name__)
+app = dash.Dash(
+    __name__, 
+    server=server,
+    url_base_pathname='/'  # Root path
+)
+server = app.server  # This line is important for gunicorn
+
+# Load initial data
+try:
+    print("Loading initial data...")
+    initial_df1, initial_df2 = load_data_cached('std_dev')
+    y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
+    print(f"Initial data loaded: {len(initial_df1)} rows")
+except Exception as e:
+    print(f"Error loading initial data: {str(e)}")
+    initial_df1 = pd.DataFrame(columns=['id', 'time'])
+    initial_df2 = pd.DataFrame(columns=['id', 'time', 'ch1s1'])
+    y_min, y_max = 0, 1
 
 # App Layout
 app.layout = html.Div([
@@ -215,26 +511,30 @@ app.layout = html.Div([
     html.Div([
         html.Div([
             html.Label('Select RPM Range'),
-            dcc.Dropdown(
-                id='rpm-dropdown',
-                options=[{'label': f'{bin:.1f}-{bin+0.5:.1f}', 'value': bin} 
-                        for bin in BINS],
-                value=BINS[0],
-                clearable=False
+            dcc.RangeSlider(
+                id='rpm-range-slider',
+                min=0,
+                max=18,
+                step=0.5,
+                marks={i: f'{i}' for i in range(0, 19, 3)},
+                value=[0, 18],
+                tooltip={"placement": "bottom", "always_visible": True}
             ),
-        ], style={'width': '30%', 'padding': '10px'}),
+        ], style={'width': '45%', 'padding': '10px'}),
         
         html.Div([
             html.Label('Date Range'),
             dcc.DatePickerRange(
                 id='date-picker',
-                min_date_allowed=initial_df1['time'].min().date(),
-                max_date_allowed=initial_df1['time'].max().date(),
-                start_date=initial_df1['time'].min().date(),
-                end_date=initial_df1['time'].max().date()
+                min_date_allowed=initial_df1['time'].min().date() if not initial_df1.empty else datetime.now().date(),
+                max_date_allowed=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date(),
+                start_date=initial_df1['time'].min().date() if not initial_df1.empty else datetime.now().date(),
+                end_date=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date()
             ),
-        ], style={'width': '40%', 'padding': '10px'}),
-        
+        ], style={'width': '45%', 'padding': '10px'}),
+    ], style={'display': 'flex', 'justifyContent': 'space-between'}),
+    
+    html.Div([
         html.Div([
             html.Label('Moving Average (days)'),
             dcc.Slider(
@@ -246,12 +546,36 @@ app.layout = html.Div([
                 step=1
             ),
         ], style={'width': '30%', 'padding': '10px'}),
+        
+        html.Div([
+            html.Label('Data Transformation'),
+            dcc.Dropdown(
+                id='transform-dropdown',
+                options=TRANSFORMATIONS,
+                value='none',
+                clearable=False
+            ),
+        ], style={'width': '30%', 'padding': '10px'}),
+        
+        html.Div([
+            html.Label('Baseline Adjustment'),
+            dcc.RadioItems(
+                id='baseline-radio',
+                options=[
+                    {'label': 'Raw Data', 'value': 'raw'},
+                    {'label': 'Baseline Adjusted', 'value': 'adjusted'}
+                ],
+                value='raw',
+                labelStyle={'display': 'inline-block', 'margin-right': '10px'}
+            ),
+        ], style={'width': '30%', 'padding': '10px'}),
     ], style={'display': 'flex', 'justifyContent': 'space-between'}),
     
     html.Div([
         html.Label('Y-axis Range'),
         dcc.Input(id='y-min-input', type='number', value=y_min, placeholder='Min Y'),
         dcc.Input(id='y-max-input', type='number', value=y_max, placeholder='Max Y'),
+        html.Button('Auto Scale', id='auto-scale-button', n_clicks=0),
     ], style={'padding': '10px'}),
     
     dcc.Loading(
@@ -275,7 +599,7 @@ app.layout = html.Div([
     # Add initial loading message
     html.Div(
         id='initial-loading',
-        children='Loading data from S3... This may take a few minutes on first load.',
+        children='Loading data... This may take a few minutes on first load.',
         style={
             'textAlign': 'center',
             'padding': '20px',
@@ -291,15 +615,17 @@ app.layout = html.Div([
     [Input('metric-dropdown', 'value'),
      Input('sensor-dropdown', 'value'),
      Input('channel-dropdown', 'value'),
-     Input('rpm-dropdown', 'value'),
+     Input('rpm-range-slider', 'value'),
      Input('date-picker', 'start_date'),
      Input('date-picker', 'end_date'),
      Input('y-min-input', 'value'),
      Input('y-max-input', 'value'),
-     Input('ma-slider', 'value')]
+     Input('ma-slider', 'value'),
+     Input('transform-dropdown', 'value'),
+     Input('baseline-radio', 'value')]
 )
-def update_graph(selected_metric, selected_sensor, selected_channels, rpm_bin, 
-                start_date, end_date, y_min, y_max, ma_days):
+def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range, 
+                start_date, end_date, y_min, y_max, ma_days, transform_type, baseline_option):
     try:
         if not all([selected_metric, selected_sensor, selected_channels]):
             raise PreventUpdate
@@ -316,9 +642,10 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_bin,
                (merged_df1['time'].dt.date <= end_dt)
         df_filtered = merged_df1.loc[mask].copy()
         
-        # Filter by RPM efficiently
-        rpm_mask = (merged_df2['ch1s1'] >= rpm_bin) & \
-                  (merged_df2['ch1s1'] < (rpm_bin + 0.5))
+        # Filter by RPM range efficiently
+        rpm_min, rpm_max = rpm_range  # Using rpm_range from the slider
+        rpm_mask = (merged_df2['ch1s1'] >= rpm_min) & \
+                  (merged_df2['ch1s1'] < rpm_max)
         rpm_filtered = merged_df2.loc[rpm_mask, ['id', 'time']]
         
         # Merge filtered data
@@ -329,11 +656,41 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_bin,
             how='inner'
         )
         
+        # Sort by time for proper processing
+        final_df = final_df.sort_values('time')
+        
         # Clear memory
         del df_filtered, rpm_filtered
         
         if final_df.empty:
-            return {}, "No data available for the selected filters"
+            empty_fig = go.Figure()
+            empty_fig.update_layout(
+                title="No data available for the selected filters",
+                annotations=[dict(
+                    text="No data available for the selected filters",
+                    showarrow=False,
+                    xref="paper",
+                    yref="paper",
+                    x=0.5,
+                    y=0.5
+                )]
+            )
+            return empty_fig, "No data available for the selected filters"
+        
+        # Apply baseline adjustment if selected
+        baseline_text = "Raw Data"
+        if baseline_option == 'adjusted':
+            final_df, adjustments = apply_baseline_adjustment(final_df)
+            if adjustments:
+                print(f"Applied baseline adjustments: {adjustments}")
+            baseline_text = "Baseline Adjusted"
+        
+        # Apply transformation if selected
+        transform_description = "No Transformation"
+        if transform_type != 'none':
+            # Get all columns to transform
+            columns_to_transform = [f'{ch}{selected_sensor}' for ch in selected_channels]
+            final_df, transform_description = apply_transformation(final_df, transform_type, columns_to_transform)
         
         # Create figure
         fig = go.Figure()
@@ -342,74 +699,197 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_bin,
         for ch in (selected_channels if isinstance(selected_channels, list) else [selected_channels]):
             col_name = f'{ch}{selected_sensor}'
             if col_name in final_df.columns:
-                # Calculate moving average efficiently
-                ma_data = (final_df.set_index('time')[col_name]
-                          .resample('D')
-                          .mean()
-                          .rolling(window=ma_days, min_periods=1)
-                          .mean())
+                # First, calculate daily means to reduce noise
+                daily_data = final_df.set_index('time')[col_name].resample('D').mean()
+                
+                # Then apply the moving average to the daily data
+                ma_data = daily_data.rolling(window=ma_days, min_periods=1).mean()
                 
                 if not ma_data.empty:
+                    # Add the raw moving average line (lighter, with markers)
                     fig.add_trace(go.Scatter(
                         x=ma_data.index,
                         y=ma_data.values,
                         mode='lines+markers',
-                        name=f'Channel {ch} ({ma_days}-day MA)',
+                        name=f'{ch} ({ma_days}-day MA)',
                         line=dict(color=COLORS[ch], width=1.5),
-                        marker=dict(color=COLORS[ch], size=5)
+                        marker=dict(color=COLORS[ch], size=5),
+                        opacity=0.7
                     ))
+                    
+                    # Apply sigma filter and smoothing to the MA data
+                    try:
+                        # Create a temporary dataframe with the MA data
+                        temp_df = pd.DataFrame({'value': ma_data.values}, index=ma_data.index)
+                        
+                        # Apply sigma filter and smoothing
+                        filtered_series, smoothed_series = apply_sigma_filter_and_smooth(
+                            temp_df, 'value', 
+                            sigma_threshold=2.0,  # 2 standard deviations
+                            window_size=15,       # 15-day window for smoothing
+                            poly_order=3          # 3rd order polynomial
+                        )
+                        
+                        # Add the filtered data (optional)
+                        fig.add_trace(go.Scatter(
+                            x=ma_data.index,
+                            y=filtered_series.values,
+                            mode='markers',
+                            name=f'{ch} (Filtered)',
+                            marker=dict(color=COLORS[ch], size=4, symbol='circle-open'),
+                            opacity=0.5
+                        ))
+                        
+                        # Add the smoothed curve (thicker, no markers)
+                        fig.add_trace(go.Scatter(
+                            x=ma_data.index,
+                            y=smoothed_series.values,
+                            mode='lines',
+                            name=f'{ch} (Smoothed Trend)',
+                            line=dict(color=COLORS[ch], width=3, dash='solid'),
+                            opacity=1.0
+                        ))
+                    except Exception as e:
+                        print(f"Error creating smoothed curve: {str(e)}")
+        
+        # Add period markers
+        for period_name, (start_date, end_date) in COMPARISON_PERIODS.items():
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            
+            # Add vertical lines at period boundaries
+            fig.add_vline(x=start_dt, line_dash="dash", line_color="gray", opacity=0.7)
+            fig.add_vline(x=end_dt, line_dash="dash", line_color="gray", opacity=0.7)
+            
+            # Add period annotation
+            fig.add_annotation(
+                x=(start_dt + (end_dt - start_dt)/2),
+                y=1.05,
+                text=period_name,
+                showarrow=False,
+                xref="x",
+                yref="paper",
+                font=dict(size=12, color="black"),
+                bgcolor="rgba(255, 255, 255, 0.8)",
+                bordercolor="gray",
+                borderwidth=1
+            )
+            
+            # Add shaded area for period
+            fig.add_shape(
+                type="rect",
+                x0=start_dt,
+                x1=end_dt,
+                y0=0,
+                y1=1,
+                xref="x",
+                yref="paper",
+                fillcolor="gray",
+                opacity=0.1,
+                layer="below",
+                line_width=0,
+            )
         
         # Update layout
+        title_text = f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor}'
+        if baseline_option == 'adjusted':
+            title_text += ' (Baseline Adjusted)'
+        if transform_type != 'none':
+            title_text += f' ({transform_description})'
+            
+        rpm_text = f"RPM Range: {rpm_min}-{rpm_max}"
+            
         fig.update_layout(
-            title=f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor}',
+            title=title_text,
             xaxis_title='Time',
-            yaxis_title='Value',
+            yaxis_title=f'{selected_metric.replace("_", " ").title()} Value',
             yaxis=dict(range=[y_min, y_max]),
-            height=600
+            height=600,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            margin=dict(b=100)  # Add bottom margin for annotation
+        )
+        
+        # Add note about data processing
+        processing_note = f"{baseline_text} | {rpm_text} | Sigma-filtered (2σ) with Savitzky-Golay smoothing"
+        if transform_type != 'none':
+            processing_note += f" | {transform_description}"
+            
+        fig.add_annotation(
+            text=processing_note,
+            xref="paper", yref="paper",
+            x=0.5, y=-0.15,
+            showarrow=False,
+            font=dict(size=10),
+            bgcolor="rgba(255, 240, 220, 0.8)",
+            bordercolor="orange",
+            borderwidth=1
         )
         
         return fig, "Data processed successfully"
         
     except Exception as e:
         print(f"Error: {str(e)}")
-        return {}, f"Error: {str(e)}"
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            title="Error",
+            annotations=[dict(
+                text=f"Error: {str(e)}",
+                showarrow=False,
+                xref="paper",
+                yref="paper",
+                x=0.5,
+                y=0.5
+            )]
+        )
+        return empty_fig, f"Error: {str(e)}"
 
 @app.callback(
-    Output("download-graph", "data"),
-    Input("btn-download", "n_clicks"),
+    [Output('y-min-input', 'value'),
+     Output('y-max-input', 'value')],
+    [Input('auto-scale-button', 'n_clicks')],
     [State('metric-dropdown', 'value'),
      State('sensor-dropdown', 'value'),
-     State('rpm-dropdown', 'value'),
-     State('ma-slider', 'value'),
-     State('sensor-graph', 'figure')],
-    prevent_initial_call=True
+     State('channel-dropdown', 'value')]
 )
-def download_graph(n_clicks, selected_metric, selected_sensor, rpm_bin, ma_days, figure):
-    if n_clicks:
-        filename = f'{selected_metric}_Sensor_{selected_sensor}_RPM_{rpm_bin}-{rpm_bin+0.5}_MA_{ma_days}days.png'
-        img_bytes = go.Figure(figure).to_image(
-            format='png',
-            width=1920,
-            height=1080,
-            scale=2.0
-        )
-        return dcc.send_bytes(img_bytes, filename)
-
-def find_free_port(start_port=8050, max_port=8070):
-    """Find a free port in the given range."""
-    for port in range(start_port, max_port + 1):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind(('0.0.0.0', port))
-            sock.close()
-            return port
-        except OSError:
-            continue
-    raise OSError("No free ports found in range")
+def update_y_axis_range(n_clicks, metric, sensor, channels):
+    if n_clicks == 0:
+        raise PreventUpdate
+    
+    try:
+        # Load data
+        df1, _ = load_data_cached(metric)
+        
+        # Calculate y limits
+        y_min, y_max = calculate_y_limits(df1, channels, [sensor])
+        
+        # Add some padding
+        y_range = y_max - y_min
+        y_min = y_min - 0.05 * y_range
+        y_max = y_max + 0.05 * y_range
+        
+        return y_min, y_max
+    except:
+        return None, None
 
 if __name__ == "__main__":
     try:
-        port = int(os.environ.get("PORT", 8050))
-        app.run_server(debug=False, host='0.0.0.0', port=port)
+        # Get port from environment variable or use default
+        port = int(os.environ.get('PORT', 8051))
+        
+        # Get host from environment variable or use default
+        host = os.environ.get('HOST', '0.0.0.0')
+        
+        # Run the server with specified host and port
+        app.run_server(
+            host=host,
+            port=port,
+            debug=True
+        )
     except Exception as e:
         print(f"Failed to start server: {str(e)}")
