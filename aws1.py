@@ -119,52 +119,58 @@ def load_data_cached(metric):
             tables = [row[0] for row in cursor.fetchall()]
             print(f"Available tables in database: {tables}")
             
-            # Use the sensor_data table for all metrics
-            # This assumes your database has a structure with a single table containing all metrics
-            if 'sensor_data' in tables:
-                # Get all data and filter by metric in Python
+            # Try to find the appropriate tables
+            if f'{metric}_data' in tables:
+                # If there's a specific table for this metric
+                df1 = pd.read_sql(f"SELECT * FROM {metric}_data", conn)
+                print(f"Loaded data from {metric}_data table")
+            elif 'sensor_data' in tables:
+                # If there's a general sensor_data table
                 df1 = pd.read_sql("SELECT * FROM sensor_data", conn)
-                
-                # Get RPM data
-                if 'rpm_data' in tables:
-                    df2 = pd.read_sql("SELECT * FROM rpm_data", conn)
-                else:
-                    # If no rpm_data table, create a dummy one
-                    df2 = pd.DataFrame({'id': df1['id'].unique(), 
-                                       'time': df1['time'].unique(),
-                                       'ch1s1': np.random.uniform(800, 1200, len(df1['id'].unique()))})
-                
-                conn.close()
-                print(f"Successfully loaded data from database")
+                print("Loaded data from sensor_data table")
             else:
-                # Create sample data as fallback
-                print("No suitable tables found, creating sample data")
-                dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
-                
-                # Create sample metric data
-                df1 = pd.DataFrame({
-                    'id': range(100),
-                    'time': dates
-                })
-                
-                # Add channel columns
-                for ch in CHANNELS:
-                    for s in SENSORS:
-                        col_name = f"{ch}{s}"
-                        df1[col_name] = np.random.normal(10, 2, 100)
-                
-                # Create sample RPM data
-                df2 = pd.DataFrame({
-                    'id': range(100),
-                    'time': dates,
-                    'ch1s1': np.random.uniform(800, 1200, 100)
-                })
-                
-                conn.close()
-                
+                # If no suitable table is found, use the first table
+                if tables:
+                    df1 = pd.read_sql(f"SELECT * FROM {tables[0]}", conn)
+                    print(f"Loaded data from {tables[0]} table")
+                else:
+                    raise ValueError("No tables found in database")
+            
+            # Get RPM data
+            if 'rpm_data' in tables:
+                df2 = pd.read_sql("SELECT * FROM rpm_data", conn)
+                print("Loaded RPM data from rpm_data table")
+            else:
+                # If no rpm_data table, create one based on the first dataframe
+                print("No rpm_data table found, creating synthetic RPM data")
+                if 'id' in df1.columns and 'time' in df1.columns:
+                    unique_ids = df1['id'].unique()
+                    unique_times = df1['time'].unique()
+                    
+                    # Create a dataframe with unique id/time combinations
+                    id_time_pairs = []
+                    for id_val in unique_ids:
+                        for time_val in unique_times:
+                            id_time_pairs.append((id_val, time_val))
+                    
+                    df2 = pd.DataFrame(id_time_pairs, columns=['id', 'time'])
+                    df2['ch1s1'] = np.random.uniform(800, 1200, len(df2))
+                else:
+                    # If no id/time columns, create completely synthetic data
+                    dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
+                    df2 = pd.DataFrame({
+                        'id': range(100),
+                        'time': dates,
+                        'ch1s1': np.random.uniform(800, 1200, 100)
+                    })
+            
+            conn.close()
+            
         except Exception as e:
             print(f"Error accessing database from S3: {str(e)}")
-            # Create sample data as fallback
+            print("Creating synthetic data as fallback")
+            
+            # Create synthetic data
             dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
             
             # Create sample metric data
@@ -188,13 +194,33 @@ def load_data_cached(metric):
         
         # Process data
         if not df1.empty and not df2.empty:
+            # Ensure required columns exist
+            if 'id' not in df1.columns:
+                df1['id'] = range(len(df1))
+            if 'time' not in df1.columns:
+                df1['time'] = pd.date_range(start='2023-01-01', periods=len(df1), freq='D')
+            
+            if 'id' not in df2.columns:
+                df2['id'] = range(len(df2))
+            if 'time' not in df2.columns:
+                df2['time'] = pd.date_range(start='2023-01-01', periods=len(df2), freq='D')
+            if 'ch1s1' not in df2.columns:
+                df2['ch1s1'] = np.random.uniform(800, 1200, len(df2))
+            
+            # Ensure channel columns exist
+            for ch in CHANNELS:
+                for s in SENSORS:
+                    col_name = f"{ch}{s}"
+                    if col_name not in df1.columns:
+                        df1[col_name] = np.random.normal(10, 2, len(df1))
+            
             # Convert time columns to datetime
             try:
                 df1['time'] = pd.to_datetime(df1['time'])
                 df2['time'] = pd.to_datetime(df2['time'])
             except Exception as e:
                 print(f"Error converting time columns: {str(e)}")
-                # Create time columns if they don't exist or can't be converted
+                # Create time columns if they can't be converted
                 df1['time'] = pd.date_range(start='2023-01-01', periods=len(df1), freq='D')
                 df2['time'] = pd.date_range(start='2023-01-01', periods=len(df2), freq='D')
             
@@ -221,10 +247,12 @@ def load_data_cached(metric):
             
     except Exception as e:
         print(f"Error loading data: {str(e)}")
-        # Return sample data as fallback
+        print("Creating synthetic data as final fallback")
+        
+        # Create synthetic data as final fallback
         dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         
-        # Create sample metric data
+        # Create sample metric data with all required columns
         df1 = pd.DataFrame({
             'id': range(100),
             'time': dates
@@ -245,7 +273,7 @@ def load_data_cached(metric):
         
         # Store in cache
         data_cache[metric] = (df1, df2)
-        print("Created sample data as fallback")
+        print("Created synthetic data as final fallback")
         return df1, df2
 
 # Calculate default y-limits
