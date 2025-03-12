@@ -139,10 +139,15 @@ def load_database():
         print(f"Error loading database: {str(e)}")
         return False
 
-# Update the load_data_cached function based on your previously working code
-@lru_cache(maxsize=5)  # Cache the 5 most recent metrics
+# Update the load_data_cached function with more aggressive memory optimization
 def load_data_cached(metric):
     """Load data with caching to improve performance"""
+    # Don't use lru_cache decorator as it can lead to memory issues
+    global data_cache
+    
+    if metric in data_cache:
+        return data_cache[metric]
+    
     try:
         start_time = time.time()
         print(f"Starting data load for {metric}...")
@@ -183,52 +188,68 @@ def load_data_cached(metric):
             if not metric_table_name:
                 raise ValueError(f"Table for metric {metric} not found in database")
             
-            # Read only necessary columns from main_data
+            # Get a sample of data instead of loading everything
+            # First, count rows to determine if sampling is needed
+            cursor.execute(f"SELECT COUNT(*) FROM {metric_table_name}")
+            row_count = cursor.fetchone()[0]
+            print(f"Table {metric_table_name} has {row_count} rows")
+            
+            # Determine sample size - use all rows if less than 1000, otherwise sample
+            sample_size = min(1000, row_count)
+            if row_count > 1000:
+                print(f"Sampling {sample_size} rows from {row_count} total rows")
+                
+                # Get a list of all IDs
+                cursor.execute(f"SELECT id FROM {metric_table_name}")
+                all_ids = [row[0] for row in cursor.fetchall()]
+                
+                # Randomly sample IDs
+                import random
+                random.seed(42)  # For reproducibility
+                sampled_ids = random.sample(all_ids, sample_size)
+                
+                # Create a string of IDs for the SQL query
+                ids_str = ','.join(str(id) for id in sampled_ids)
+                
+                # Get the sampled data
+                df1 = pd.read_sql(f"SELECT * FROM {metric_table_name} WHERE id IN ({ids_str})", conn)
+            else:
+                # Get all data if it's a small table
+                df1 = pd.read_sql(f"SELECT * FROM {metric_table_name}", conn)
+            
+            print(f"Loaded {len(df1)} rows from {metric_table_name}")
+            
+            # Get corresponding main_data for these IDs
+            ids_str = ','.join(str(id) for id in df1['id'].tolist())
             try:
                 df = pd.read_sql(
-                    'SELECT id, time FROM main_data',
+                    f'SELECT id, time FROM main_data WHERE id IN ({ids_str})',
                     conn,
                     parse_dates=['time']
                 )
-                print(f"Loaded main_data with {len(df)} rows")
+                print(f"Loaded {len(df)} rows from main_data")
             except Exception as e:
                 print(f"Error loading main_data: {str(e)}")
                 # Create a fallback dataframe
                 df = pd.DataFrame({
-                    'id': range(100),
-                    'time': pd.date_range(start='2023-01-01', periods=100, freq='D')
+                    'id': df1['id'].unique(),
+                    'time': pd.date_range(start='2023-01-01', periods=len(df1['id'].unique()), freq='D')
                 })
             
-            # Read RPM data
+            # Get corresponding RPM data
             try:
                 df_rpm = pd.read_sql(
-                    'SELECT id, ch1s1 FROM rpm',
+                    f'SELECT id, ch1s1 FROM rpm WHERE id IN ({ids_str})',
                     conn
                 )
-                print(f"Loaded rpm data with {len(df_rpm)} rows")
+                print(f"Loaded {len(df_rpm)} rows from rpm")
             except Exception as e:
                 print(f"Error loading rpm data: {str(e)}")
                 # Create a fallback dataframe
                 df_rpm = pd.DataFrame({
-                    'id': range(100),
-                    'ch1s1': np.random.uniform(800, 1200, 100)
+                    'id': df1['id'].unique(),
+                    'ch1s1': np.random.uniform(800, 1200, len(df1['id'].unique()))
                 })
-            
-            # Read metric data
-            try:
-                df1 = pd.read_sql(f'SELECT * FROM {metric_table_name}', conn)
-                print(f"Loaded {metric_table_name} data with {len(df1)} rows")
-            except Exception as e:
-                print(f"Error loading {metric_table_name} data: {str(e)}")
-                # Create a fallback dataframe
-                df1 = pd.DataFrame({
-                    'id': range(100)
-                })
-                # Add channel columns
-                for ch in CHANNELS:
-                    for s in SENSORS:
-                        col_name = f"{ch}{s}"
-                        df1[col_name] = np.random.normal(10, 2, 100)
             
             # Process columns and convert to float where possible
             for col in df1.columns:
@@ -268,6 +289,15 @@ def load_data_cached(metric):
             # Clean up to save memory
             del df, df1, df_rpm
             
+            # Limit cache size
+            if len(data_cache) >= 3:  # Only keep 3 metrics in memory
+                oldest_key = next(iter(data_cache))
+                del data_cache[oldest_key]
+                print(f"Removed {oldest_key} from cache to save memory")
+            
+            # Store in cache
+            data_cache[metric] = (merged_df1, merged_df2)
+            
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
             print(f"Final data size: {len(merged_df1)} rows")
             
@@ -277,7 +307,7 @@ def load_data_cached(metric):
         print(f"Error loading data: {str(e)}")
         print("Creating synthetic data as final fallback")
         
-        # Create synthetic data as final fallback
+        # Create minimal synthetic data as final fallback
         dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
         
         # Create sample metric data with all required columns
@@ -302,6 +332,8 @@ def load_data_cached(metric):
             'ch1s1': np.random.uniform(800, 1200, 100)
         })
         
+        # Store in cache
+        data_cache[metric] = (df1, df2)
         print("Created synthetic data as final fallback")
         return df1, df2
 
@@ -547,6 +579,32 @@ def apply_sigma_filter_and_smooth(df, column, sigma_threshold=2.0, window_size=7
     
     return filtered_series, smoothed_series
 
+# Memory management function
+def manage_memory():
+    """Print memory usage and clear cache if needed"""
+    import psutil
+    import gc
+    
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / (1024 * 1024)
+    
+    print(f"Current memory usage: {memory_mb:.2f} MB")
+    
+    # If memory usage is high, clear cache
+    if memory_mb > 400:  # 400MB threshold
+        global data_cache
+        data_cache.clear()
+        gc.collect()
+        print("Memory usage high - cleared cache and ran garbage collection")
+        
+        # Print new memory usage
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / (1024 * 1024)
+        print(f"New memory usage: {memory_mb:.2f} MB")
+    
+    return memory_mb
+
 # Initialize Dash app with Flask server
 server = Flask(__name__)
 app = dash.Dash(
@@ -572,6 +630,9 @@ except Exception as e:
     y_min, y_max = 0, 10  # Default values
 
 # App Layout
+memory_usage = manage_memory()
+print(f"Memory usage before creating layout: {memory_usage:.2f} MB")
+
 app.layout = html.Div([
     html.H1("Sensor Data Analysis Dashboard"),
     
