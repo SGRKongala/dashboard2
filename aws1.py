@@ -119,18 +119,44 @@ def load_data_cached(metric):
             tables = [row[0] for row in cursor.fetchall()]
             print(f"Available tables in database: {tables}")
             
-            # Try to load the metric table directly
-            if metric in tables:
-                df1 = pd.read_sql(f"SELECT * FROM {metric}", conn)
-                print(f"Loaded data from {metric} table")
+            # Find the table name with case-insensitive matching
+            table_name = None
+            for table in tables:
+                if table.lower() == metric.lower():
+                    table_name = table
+                    break
+            
+            # If not found, try with underscore variations
+            if not table_name:
+                for table in tables:
+                    if table.lower().replace('_', '') == metric.lower().replace('_', ''):
+                        table_name = table
+                        break
+            
+            # If still not found, try with partial matching
+            if not table_name:
+                for table in tables:
+                    if metric.lower() in table.lower():
+                        table_name = table
+                        break
+            
+            if table_name:
+                df1 = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+                print(f"Loaded data from {table_name} table")
             else:
-                print(f"Table {metric} not found in database")
-                raise ValueError(f"Table {metric} not found in database")
+                print(f"No matching table found for {metric}")
+                raise ValueError(f"No matching table found for {metric}")
             
             # Get RPM data
-            if 'rpm' in tables:
-                df2 = pd.read_sql("SELECT * FROM rpm", conn)
-                print("Loaded RPM data from rpm table")
+            rpm_table = None
+            for table in tables:
+                if table.lower() == 'rpm':
+                    rpm_table = table
+                    break
+            
+            if rpm_table:
+                df2 = pd.read_sql(f"SELECT * FROM {rpm_table}", conn)
+                print(f"Loaded RPM data from {rpm_table} table")
             else:
                 # If no rpm table, create one based on the first dataframe
                 print("No rpm table found, creating synthetic RPM data")
