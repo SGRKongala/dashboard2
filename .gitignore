@@ -15,3 +15,6 @@ ENV/
 .DS_Store
 .ipynb_checkpoints/
 
+memory_test.py
+review.ipynb
+test.ipynb
