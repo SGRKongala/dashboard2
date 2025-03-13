@@ -1,18 +1,23 @@
-# Gunicorn configuration for memory-constrained environments
+# Gunicorn configuration for extremely memory-constrained environments
 import os
+import sys
 
-# Worker settings
-workers = 1  # Use only one worker
-threads = 2  # Use 2 threads per worker
-worker_class = 'gthread'  # Use threaded worker
+# Force garbage collection at startup
+import gc
+gc.collect()
+
+# Worker settings - absolute minimum
+workers = 1
+threads = 1
+worker_class = 'sync'  # Simplest worker type
 
 # Timeouts
-timeout = 120  # 2 minute timeout
-keepalive = 5  # 5 seconds keepalive
+timeout = 120
+keepalive = 5
 
-# Memory management
-max_requests = 10  # Restart workers after 10 requests
-max_requests_jitter = 3  # Add jitter to prevent all workers restarting at once
+# Memory management - very aggressive
+max_requests = 5  # Restart workers frequently
+max_requests_jitter = 2
 
 # Logging
 loglevel = 'info'
@@ -22,10 +27,22 @@ errorlog = '-'
 # Bind to the port Render expects
 bind = f"0.0.0.0:{os.environ.get('PORT', '8050')}"
 
-# Preload app to save memory
-preload_app = True
+# Don't preload app to save memory
+preload_app = False
+
+# Set lower memory limits for Python
+import resource
+# 400MB soft limit, 450MB hard limit
+resource.setrlimit(resource.RLIMIT_AS, (400 * 1024 * 1024, 450 * 1024 * 1024))
 
 def on_starting(server):
-    """Log when server starts"""
-    import logging
-    logging.info("Starting server with memory-optimized settings") 
+    """Log when server starts and set memory limits"""
+    print("Starting server with extremely memory-optimized settings")
+    
+    # Set pandas options to minimize memory
+    try:
+        import pandas as pd
+        pd.options.mode.chained_assignment = None
+        pd.options.mode.use_inf_as_na = True
+    except:
+        pass 
