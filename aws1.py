@@ -1,6 +1,7 @@
 import gc
 import os
 import sys
+from datetime import datetime
 
 # Force garbage collection at startup
 gc.collect()
@@ -531,15 +532,20 @@ print("Loading database tables at startup...")
 load_database()
 print("Database loading complete")
 
-# Load initial data and calculate y-limits
+# Try to load initial data
 try:
     print("Loading initial data...")
     initial_df1, initial_df2 = load_data_cached('std_dev')
-    y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
-    print(f"Calculated initial y-limits: {y_min} to {y_max}")
+    if initial_df1 is None:
+        # Create empty dataframes with the expected structure
+        initial_df1 = pd.DataFrame(columns=['id', 'main_data_id', 'time'] + [f"{ch}{s}" for ch in CHANNELS for s in SENSORS])
+        initial_df1['time'] = pd.to_datetime(initial_df1['time'])
+    print(f"Initial data loaded: {len(initial_df1)} rows")
 except Exception as e:
-    print(f"Error calculating initial y-limits: {str(e)}")
-    y_min, y_max = 0, 10  # Default values
+    print(f"Error loading initial data: {str(e)}")
+    # Create empty dataframes with the expected structure
+    initial_df1 = pd.DataFrame(columns=['id', 'main_data_id', 'time'] + [f"{ch}{s}" for ch in CHANNELS for s in SENSORS])
+    initial_df1['time'] = pd.to_datetime(initial_df1['time'])
 
 # App Layout
 memory_usage = manage_memory()
@@ -648,8 +654,8 @@ app.layout = html.Div([
     
     html.Div([
         html.Label('Y-axis Range'),
-        dcc.Input(id='y-min-input', type='number', value=y_min, placeholder='Min Y'),
-        dcc.Input(id='y-max-input', type='number', value=y_max, placeholder='Max Y'),
+        dcc.Input(id='y-min-input', type='number', value=initial_df1['std_dev'].min(), placeholder='Min Y'),
+        dcc.Input(id='y-max-input', type='number', value=initial_df1['std_dev'].max(), placeholder='Max Y'),
         html.Button('Auto Scale', id='auto-scale-button', n_clicks=0),
     ], style={'padding': '10px'}),
     
