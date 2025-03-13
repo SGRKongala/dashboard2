@@ -3,13 +3,21 @@ import os
 import sys
 from datetime import datetime
 import requests  # Add requests for downloading
-import psutil  # Add psutil for memory monitoring
+import json
+import sqlite3
+import time
+import pandas as pd
+import numpy as np
+import flask
+import dash
+from dash import dcc, html, callback, Input, Output, State
+import plotly.graph_objects as go
+import tempfile
 
 # Force garbage collection at startup
 gc.collect()
 
 # Set lower memory limits for pandas
-import pandas as pd
 pd.options.mode.chained_assignment = None  # default='warn'
 
 # Only import what you absolutely need
