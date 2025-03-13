@@ -611,14 +611,9 @@ def manage_memory():
     
     return memory_mb
 
-# Initialize Dash app with Flask server
+# Initialize the server with a smaller worker class
 server = Flask(__name__)
-app = dash.Dash(
-    __name__, 
-    server=server,
-    url_base_pathname='/'  # Root path
-)
-server = app.server  # This line is important for gunicorn
+app = dash.Dash(__name__, server=server)
 
 # Load all database tables at startup
 print("Loading database tables at startup...")
@@ -1046,19 +1041,7 @@ def update_y_axis_range(n_clicks, metric, sensor, channels):
     except:
         return None, None
 
-if __name__ == "__main__":
-    try:
-        # Get port from environment variable or use default
-        port = int(os.environ.get('PORT', 8051))
-        
-        # Get host from environment variable or use default
-        host = os.environ.get('HOST', '0.0.0.0')
-        
-        # Run the server with specified host and port
-        app.run_server(
-            host=host,
-            port=port,
-            debug=True
-        )
-    except Exception as e:
-        print(f"Failed to start server: {str(e)}")
+if __name__ == '__main__':
+    # Set a very low worker timeout to prevent memory buildup
+    port = int(os.environ.get('PORT', 8050))
+    app.run_server(debug=False, host='0.0.0.0', port=port)
