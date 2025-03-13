@@ -142,8 +142,6 @@ def load_database():
 # Update the load_data_cached function with more aggressive memory optimization
 def load_data_cached(metric):
     """Load data with caching to improve performance"""
-    global data_cache
-    
     if metric in data_cache:
         return data_cache[metric]
     
@@ -151,34 +149,14 @@ def load_data_cached(metric):
         start_time = time.time()
         print(f"Starting data load for {metric}...")
         
-        # Create a temporary directory for the database file
-        temp_dir = os.path.join(tempfile.gettempdir(), 'dashboard_db')
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_db_path = os.path.join(temp_dir, 'text.db')
-        
         # Use local database file
-        if not os.path.exists(temp_db_path):
-            # Copy from local path instead of downloading
-            local_db_path = "archive/DB/text.db"
-            if os.path.exists(local_db_path):
-                import shutil
-                shutil.copy2(local_db_path, temp_db_path)
-                print(f"Copied database from {local_db_path} to {temp_db_path}")
-            else:
-                print(f"Local database not found at {local_db_path}")
-                # Fallback to download if needed
-                print(f"Downloading database from {S3_DB_URL}")
-                response = requests.get(S3_DB_URL, stream=True)
-                response.raise_for_status()
-                
-                with open(temp_db_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                
-                print(f"Database downloaded successfully to {temp_db_path}")
+        db_path = "archive/DB/text.db"
+        if not os.path.exists(db_path):
+            print(f"Database not found at {db_path}")
+            return None, None
         
         # Connect to the database
-        with sqlite3.connect(temp_db_path) as conn:
+        with sqlite3.connect(db_path) as conn:
             # Find the table name with case-insensitive matching
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -198,161 +176,83 @@ def load_data_cached(metric):
             cursor.execute(f"PRAGMA table_info({metric_table_name})")
             all_columns = [row[1] for row in cursor.fetchall()]
             
-            # Filter to only include id, main_data_id, and channel columns we care about
-            needed_columns = ['id', 'main_data_id']
-            for col in all_columns:
-                if any(ch in col for ch in CHANNELS) and any(s in col for s in SENSORS):
-                    needed_columns.append(col)
+            # Select only the columns we need
+            needed_columns = ['id', 'main_data_id', 'time']
+            for ch in CHANNELS:
+                for s in SENSORS:
+                    col = f"{ch}{s}"
+                    if col in all_columns:
+                        needed_columns.append(col)
             
-            # Create comma-separated list of columns
+            # Convert list to comma-separated string
             columns_str = ', '.join(needed_columns)
             
-            # Get the metric data with only needed columns
-            chunk_size = 5000
-            chunks = []
-            for chunk in pd.read_sql(f"SELECT {columns_str} FROM {metric_table_name}", conn, chunksize=chunk_size):
-                # Process chunk
-                # ...
-                chunks.append(processed_chunk)
-                # Check memory after each chunk
-                memory_checkpoint(400, f"After processing chunk {len(chunks)}")
+            # Load data with limit
+            query = f"SELECT {columns_str} FROM {metric_table_name} LIMIT 10000"
+            df1 = pd.read_sql_query(query, conn)
             
-            # Combine chunks if memory allows
-            if len(chunks) > 0:
-                df1 = pd.concat(chunks, ignore_index=True)
-            else:
-                df1 = pd.DataFrame()
+            # Load RPM data
+            rpm_table = None
+            for table in tables:
+                if table.lower() == 'rpm':
+                    rpm_table = table
+                    break
             
-            # Get time data from main_data
-            main_data = pd.read_sql(
-                "SELECT id, time FROM main_data",
-                conn,
-                parse_dates=['time']
-            )
-            print(f"Loaded {len(main_data)} rows from main_data")
+            if not rpm_table:
+                raise ValueError("RPM table not found in database")
             
-            # Get RPM data (only the columns we need)
-            rpm_data = pd.read_sql(
-                "SELECT main_data_id, ch1s1 FROM rpm",
-                conn
-            )
-            print(f"Loaded {len(rpm_data)} rows from rpm")
+            # Load RPM data with limit
+            query = f"SELECT id, ch1s1, ch2s1, ch3s1, ch4s1 FROM {rpm_table} LIMIT 10000"
+            df2 = pd.read_sql_query(query, conn)
             
-            # Process columns and convert to float where possible
-            for col in df1.columns:
-                if col not in ['id', 'main_data_id'] and any(ch in col for ch in CHANNELS):
-                    try:
-                        # Try direct float conversion first
-                        df1[col] = pd.to_numeric(df1[col], errors='raise')
-                    except ValueError:
-                        try:
-                            # If that fails, try to extract 'magnitude' from JSON
-                            df1[col] = df1[col].apply(lambda x: json.loads(x)['magnitude'] 
-                                                    if isinstance(x, str) and x.startswith('{') 
-                                                    else x)
-                            df1[col] = pd.to_numeric(df1[col], errors='coerce')
-                        except:
-                            print(f"Warning: Could not process column {col}")
-                            df1[col] = np.nan
+            # Check for corruption status table
+            corruption_table = None
+            for table in tables:
+                if table.lower() == 'corruption_status':
+                    corruption_table = table
+                    break
             
-            # Merge with main_data to get time information
-            merged_df1 = pd.merge(
-                main_data[['id', 'time']], 
-                df1, 
-                left_on='id',
-                right_on='main_data_id', 
-                how='inner'
-            )
-            
-            # Merge with RPM data
-            merged_df2 = pd.merge(
-                main_data[['id', 'time']], 
-                rpm_data, 
-                left_on='id',
-                right_on='main_data_id', 
-                how='inner'
-            )
-            
-            # Convert RPM column to float
-            merged_df2['ch1s1'] = pd.to_numeric(merged_df2['ch1s1'], errors='coerce')
-            
-            # Clean up to save memory
-            del df1, main_data, rpm_data
-            gc.collect()
-            
-            # Sort by time
-            merged_df1 = merged_df1.sort_values('time')
-            merged_df2 = merged_df2.sort_values('time')
-            
-            # Calculate MA7 for all sensor columns and KEEP ONLY THE MA7 VALUES
-            ma7_df = pd.DataFrame({'time': merged_df1['time'], 'id': merged_df1['id']})
-            
-            for col in merged_df1.columns:
-                if col not in ['id', 'main_data_id', 'time'] and any(ch in col for ch in CHANNELS):
-                    # Calculate MA7
-                    ma7_df[col] = merged_df1[col].rolling(window=7, min_periods=1).mean()
-            
-            # Replace the original dataframe with the MA7 version to save memory
-            del merged_df1
-            merged_df1 = ma7_df
-            
-            # Convert float columns to float32 to save memory
-            for col in merged_df1.select_dtypes(include=['float64']).columns:
-                merged_df1[col] = merged_df1[col].astype('float32')
-            
-            for col in merged_df2.select_dtypes(include=['float64']).columns:
-                merged_df2[col] = merged_df2[col].astype('float32')
-            
-            # Limit cache size
-            if len(data_cache) >= 2:  # Only keep 2 metrics in memory
-                oldest_key = next(iter(data_cache))
-                del data_cache[oldest_key]
-                print(f"Removed {oldest_key} from cache to save memory")
-            
-            # Store in cache
-            data_cache[metric] = (merged_df1, merged_df2)
-            
-            print(f"Data load completed in {time.time() - start_time:.2f} seconds")
-            print(f"Final data size: {len(merged_df1)} rows")
-            
-            # Force garbage collection
-            gc.collect()
-            
-            return merged_df1, merged_df2
-            
-    except Exception as e:
-        print(f"Error loading data: {str(e)}")
-        print("Creating synthetic data as final fallback")
+            if corruption_table:
+                # Load corruption data
+                query = f"SELECT * FROM {corruption_table} LIMIT 10000"
+                corruption_df = pd.read_sql_query(query, conn)
+                
+                # Set corrupted values to NaN
+                if 'main_data_id' in df1.columns and 'main_data_id' in corruption_df.columns:
+                    corrupted_ids = corruption_df[corruption_df['is_corrupted'] == 1]['main_data_id'].tolist()
+                    for col in df1.columns:
+                        if col not in ['id', 'main_data_id', 'time']:
+                            mask = df1['main_data_id'].isin(corrupted_ids)
+                            if mask.any():
+                                print(f"Set {mask.sum()} corrupted values to NaN for {col}")
+                                df1.loc[mask, col] = np.nan
         
-        # Create minimal synthetic data as final fallback
-        dates = pd.date_range(start='2023-01-01', periods=100, freq='D')
+        # Convert time column to datetime
+        if 'time' in df1.columns:
+            df1['time'] = pd.to_datetime(df1['time'])
         
-        # Create sample metric data with all required columns
-        df1 = pd.DataFrame({
-            'id': range(100),
-            'time': dates
-        })
+        # Convert float64 to float32 to save memory
+        for col in df1.columns:
+            if df1[col].dtype == 'float64':
+                df1[col] = df1[col].astype('float32')
         
-        # Add channel columns
-        for ch in CHANNELS:
-            for s in SENSORS:
-                col_name = f"{ch}{s}"
-                # Create some patterns in the data
-                base = np.sin(np.linspace(0, 4*np.pi, 100)) * 5 + 10
-                noise = np.random.normal(0, 1, 100)
-                df1[col_name] = base + noise
-        
-        # Create sample RPM data
-        df2 = pd.DataFrame({
-            'id': range(100),
-            'time': dates,
-            'ch1s1': np.random.uniform(800, 1200, 100)
-        })
+        for col in df2.columns:
+            if df2[col].dtype == 'float64':
+                df2[col] = df2[col].astype('float32')
         
         # Store in cache
         data_cache[metric] = (df1, df2)
-        print("Created synthetic data as final fallback")
+        
+        print(f"Data load completed in {time.time() - start_time:.2f} seconds")
+        print(f"Loaded {len(df1)} rows")
+        
         return df1, df2
+    
+    except Exception as e:
+        import traceback
+        print(f"Error loading data: {str(e)}")
+        print(traceback.format_exc())
+        return None, None
 
 # Calculate default y-limits
 def calculate_y_limits(df, channels, sensors):
