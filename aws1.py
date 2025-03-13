@@ -2,6 +2,7 @@ import gc
 import os
 import sys
 from datetime import datetime
+import requests  # Add requests for downloading
 
 # Force garbage collection at startup
 gc.collect()
@@ -150,6 +151,9 @@ def load_data_cached(metric):
         start_time = time.time()
         print(f"Starting data load for {metric}...")
         
+        # Download database if needed
+        download_database()
+        
         # Use local database file
         db_path = "archive/DB/text.db"
         if not os.path.exists(db_path):
@@ -162,6 +166,7 @@ def load_data_cached(metric):
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [row[0] for row in cursor.fetchall()]
+            print(f"Available tables in database: {tables}")
             
             metric_table_name = None
             for table in tables:
@@ -170,7 +175,24 @@ def load_data_cached(metric):
                     break
             
             if not metric_table_name:
+                # Try with capitalization variations
+                for table in tables:
+                    if table.lower().replace('_', '') == metric.lower().replace('_', ''):
+                        metric_table_name = table
+                        break
+            
+            if not metric_table_name:
+                # Try with "std_Dev" for "std_dev"
+                if metric.lower() == "std_dev":
+                    for table in tables:
+                        if table.lower() == "std_dev" or table == "std_Dev":
+                            metric_table_name = table
+                            break
+            
+            if not metric_table_name:
                 raise ValueError(f"Table for metric {metric} not found in database")
+            
+            print(f"Using table {metric_table_name} for metric {metric}")
             
             # Get only the columns we need
             # First, get all column names
@@ -191,6 +213,7 @@ def load_data_cached(metric):
             # Load data with limit
             query = f"SELECT {columns_str} FROM {metric_table_name} LIMIT 10000"
             df1 = pd.read_sql_query(query, conn)
+            print(f"Loaded data from {metric_table_name} table")
             
             # Load RPM data
             rpm_table = None
@@ -205,6 +228,7 @@ def load_data_cached(metric):
             # Load RPM data with limit
             query = f"SELECT id, ch1s1, ch2s1, ch3s1, ch4s1 FROM {rpm_table} LIMIT 10000"
             df2 = pd.read_sql_query(query, conn)
+            print(f"Loaded RPM data from {rpm_table} table")
             
             # Check for corruption status table
             corruption_table = None
