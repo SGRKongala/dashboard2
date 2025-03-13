@@ -1,27 +1,26 @@
-import dash
-from dash import dcc, html
-from dash.dependencies import Input, Output, State
-from dash.exceptions import PreventUpdate
-import sqlite3
-import pandas as pd
-import os
-import plotly.express as px
-import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-from functools import lru_cache
-import time
-import json
-import math
-# Add new imports for AWS
-import boto3
-from botocore.config import Config
-import tempfile
-import socket
-from flask import Flask
-import io
-import requests
 import gc
+import os
+import sys
+
+# Force garbage collection at startup
+gc.collect()
+
+# Set lower memory limits for pandas
+import pandas as pd
+pd.options.mode.chained_assignment = None  # default='warn'
+pd.options.mode.use_inf_as_na = True
+
+# Only import what you absolutely need
+import numpy as np
+import flask
+import dash
+from dash import dcc, html, callback, Input, Output, State
+import plotly.graph_objects as go
+import sqlite3
+import json
+import tempfile
+import time
+import psutil
 
 # Initialize data cache
 data_cache = {}
@@ -1102,7 +1101,230 @@ def memory_checkpoint(threshold_mb=400, label=""):
         log_memory(f"After forced cleanup: {label}")
     return memory_mb
 
+# Check memory at startup
+check_memory("Startup")
+
+# Minimal server initialization
+server = flask.Flask(__name__)
+app = dash.Dash(__name__, server=server)
+
+# Check memory after server init
+check_memory("After server init")
+
+# Extremely minimal layout
+app.layout = html.Div([
+    html.H1("Dashboard", style={'textAlign': 'center'}),
+    html.Div([
+        html.Label("Select Metric:"),
+        dcc.Dropdown(
+            id='metric-dropdown',
+            options=[
+                {'label': 'RMS', 'value': 'rms'},
+                {'label': 'Average', 'value': 'average_dx'},
+                {'label': 'Standard Deviation', 'value': 'std_Dev'}
+            ],
+            value='rms'
+        ),
+    ], style={'width': '30%', 'display': 'inline-block'}),
+    
+    html.Div(id='loading-div', children=[
+        html.Div("Select options and click 'Load Data' to view data"),
+        html.Button('Load Data', id='load-button', n_clicks=0)
+    ]),
+    
+    html.Div(id='graph-container', style={'display': 'none'}, children=[
+        dcc.Graph(id='time-series-graph')
+    ])
+])
+
+# Simplified data loading function
+def load_data_minimal(metric, max_rows=5000):
+    """Load minimal data for visualization"""
+    check_memory(f"Before loading {metric}")
+    
+    try:
+        # Clear any existing cache
+        global data_cache
+        data_cache.clear()
+        gc.collect()
+        
+        # Connect to local database
+        db_path = "archive/DB/text.db"
+        if not os.path.exists(db_path):
+            print(f"Database not found at {db_path}")
+            return None, None
+        
+        conn = sqlite3.connect(db_path)
+        
+        # Get only essential columns from main_data
+        main_data = pd.read_sql(
+            "SELECT id, time FROM main_data LIMIT ?", 
+            conn, 
+            params=(max_rows,),
+            parse_dates=['time']
+        )
+        check_memory("After loading main_data")
+        
+        # Get only essential columns from rpm
+        rpm_data = pd.read_sql(
+            "SELECT main_data_id, ch1s1 FROM rpm LIMIT ?", 
+            conn,
+            params=(max_rows,)
+        )
+        check_memory("After loading rpm")
+        
+        # Find the metric table
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", 
+                      (f"%{metric}%",))
+        tables = cursor.fetchall()
+        
+        if not tables:
+            print(f"No table found matching {metric}")
+            conn.close()
+            return None, None
+        
+        metric_table = tables[0][0]
+        
+        # Get column names
+        cursor.execute(f"PRAGMA table_info({metric_table})")
+        all_columns = [row[1] for row in cursor.fetchall()]
+        
+        # Select only essential columns
+        needed_columns = ['id', 'main_data_id']
+        sensor_columns = []
+        
+        # Only get a few sensor columns to save memory
+        for col in all_columns:
+            if col.startswith('ch1s') and len(sensor_columns) < 3:
+                needed_columns.append(col)
+                sensor_columns.append(col)
+        
+        # Load limited data with only needed columns
+        columns_str = ', '.join(needed_columns)
+        metric_data = pd.read_sql(
+            f"SELECT {columns_str} FROM {metric_table} LIMIT ?", 
+            conn,
+            params=(max_rows,)
+        )
+        check_memory(f"After loading {metric_table}")
+        
+        # Convert to numeric
+        for col in sensor_columns:
+            try:
+                metric_data[col] = pd.to_numeric(metric_data[col], errors='coerce')
+            except:
+                print(f"Could not convert {col} to numeric")
+        
+        # Join with time data
+        merged_df = pd.merge(
+            main_data[['id', 'time']], 
+            metric_data,
+            left_on='id', 
+            right_on='main_data_id',
+            how='inner'
+        )
+        
+        # Join with rpm data
+        rpm_merged = pd.merge(
+            main_data[['id', 'time']], 
+            rpm_data,
+            left_on='id', 
+            right_on='main_data_id',
+            how='inner'
+        )
+        
+        # Clean up to save memory
+        del main_data, metric_data, rpm_data
+        gc.collect()
+        check_memory("After merging and cleanup")
+        
+        # Calculate MA7 and keep only that
+        ma7_df = pd.DataFrame({'time': merged_df['time']})
+        
+        for col in sensor_columns:
+            ma7_df[col] = merged_df[col].rolling(window=7, min_periods=1).mean()
+        
+        # Convert to float32
+        for col in ma7_df.columns:
+            if ma7_df[col].dtype == 'float64':
+                ma7_df[col] = ma7_df[col].astype('float32')
+        
+        # Clean up
+        del merged_df
+        gc.collect()
+        check_memory("After MA7 calculation")
+        
+        conn.close()
+        return ma7_df, rpm_merged
+        
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        return None, None
+
+# Simplified callback
+@app.callback(
+    [Output('graph-container', 'style'),
+     Output('time-series-graph', 'figure'),
+     Output('loading-div', 'children')],
+    [Input('load-button', 'n_clicks')],
+    [State('metric-dropdown', 'value')]
+)
+def update_graph(n_clicks, metric):
+    if n_clicks == 0:
+        return {'display': 'none'}, {}, [
+            html.Div("Select options and click 'Load Data' to view data"),
+            html.Button('Load Data', id='load-button', n_clicks=0)
+        ]
+    
+    # Show loading message
+    loading_message = html.Div("Loading data... please wait")
+    
+    # Load data with strict row limit
+    df, rpm_df = load_data_minimal(metric, max_rows=2000)
+    
+    if df is None or len(df) == 0:
+        return {'display': 'none'}, {}, [
+            html.Div("Error loading data. Please try again."),
+            html.Button('Retry', id='load-button', n_clicks=0)
+        ]
+    
+    # Create a simple figure
+    fig = go.Figure()
+    
+    # Add only a few traces to save memory
+    for col in df.columns:
+        if col != 'time' and len(fig.data) < 3:  # Limit to 3 traces
+            fig.add_trace(go.Scatter(
+                x=df['time'], 
+                y=df[col],
+                mode='lines',
+                name=col
+            ))
+    
+    # Simple layout
+    fig.update_layout(
+        title=f"{metric.capitalize()} Time Series",
+        xaxis_title="Time",
+        yaxis_title="Value",
+        height=500
+    )
+    
+    # Force cleanup
+    check_memory("Before returning figure")
+    
+    return {'display': 'block'}, fig, [
+        html.Div("Data loaded successfully"),
+        html.Button('Refresh Data', id='load-button', n_clicks=0)
+    ]
+
+# Add this at the end
 if __name__ == '__main__':
-    # Set a very low worker timeout to prevent memory buildup
+    # Check memory before running server
+    check_memory("Before run_server")
+    
+    # Get port from environment variable
     port = int(os.environ.get('PORT', 8050))
+    
+    # Run with minimal settings
     app.run_server(debug=False, host='0.0.0.0', port=port)
