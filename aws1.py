@@ -523,7 +523,7 @@ def manage_memory():
     return memory_mb
 
 # Initialize the server with a smaller worker class
-server = Flask(__name__)
+server = flask.Flask(__name__)
 app = dash.Dash(__name__, server=server)
 
 # Load all database tables at startup
