@@ -356,6 +356,7 @@ def apply_baseline_adjustment(df, time_col='time'):
 
 # Initialize Dash app
 app = dash.Dash(__name__)
+server = app.server  # Add this line to expose the Flask server
 
 # Load initial data
 try:
