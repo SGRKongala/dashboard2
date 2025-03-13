@@ -21,6 +21,7 @@ import socket
 from flask import Flask
 import io
 import requests
+import gc
 
 # Initialize data cache
 data_cache = {}
@@ -142,7 +143,6 @@ def load_database():
 # Update the load_data_cached function with more aggressive memory optimization
 def load_data_cached(metric):
     """Load data with caching to improve performance"""
-    # Don't use lru_cache decorator as it can lead to memory issues
     global data_cache
     
     if metric in data_cache:
@@ -157,28 +157,34 @@ def load_data_cached(metric):
         os.makedirs(temp_dir, exist_ok=True)
         temp_db_path = os.path.join(temp_dir, 'text.db')
         
-        # Download the database file from S3 if not already downloaded
+        # Use local database file
         if not os.path.exists(temp_db_path):
-            print(f"Downloading database from {S3_DB_URL}")
-            response = requests.get(S3_DB_URL, stream=True)
-            response.raise_for_status()  # Raise an exception for HTTP errors
-            
-            with open(temp_db_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            print(f"Database downloaded successfully to {temp_db_path}")
-        else:
-            print(f"Using existing database file at {temp_db_path}")
+            # Copy from local path instead of downloading
+            local_db_path = "archive/DB/text.db"
+            if os.path.exists(local_db_path):
+                import shutil
+                shutil.copy2(local_db_path, temp_db_path)
+                print(f"Copied database from {local_db_path} to {temp_db_path}")
+            else:
+                print(f"Local database not found at {local_db_path}")
+                # Fallback to download if needed
+                print(f"Downloading database from {S3_DB_URL}")
+                response = requests.get(S3_DB_URL, stream=True)
+                response.raise_for_status()
+                
+                with open(temp_db_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                print(f"Database downloaded successfully to {temp_db_path}")
         
         # Connect to the database
         with sqlite3.connect(temp_db_path) as conn:
-            # First, check if the metric table exists
+            # Find the table name with case-insensitive matching
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [row[0] for row in cursor.fetchall()]
             
-            # Find the table name with case-insensitive matching
             metric_table_name = None
             for table in tables:
                 if table.lower() == metric.lower():
@@ -188,72 +194,42 @@ def load_data_cached(metric):
             if not metric_table_name:
                 raise ValueError(f"Table for metric {metric} not found in database")
             
-            # Get a sample of data instead of loading everything
-            # First, count rows to determine if sampling is needed
-            cursor.execute(f"SELECT COUNT(*) FROM {metric_table_name}")
-            row_count = cursor.fetchone()[0]
-            print(f"Table {metric_table_name} has {row_count} rows")
+            # Get only the columns we need
+            # First, get all column names
+            cursor.execute(f"PRAGMA table_info({metric_table_name})")
+            all_columns = [row[1] for row in cursor.fetchall()]
             
-            # Determine sample size - use all rows if less than 1000, otherwise sample
-            sample_size = min(1000, row_count)
-            if row_count > 1000:
-                print(f"Sampling {sample_size} rows from {row_count} total rows")
-                
-                # Get a list of all IDs
-                cursor.execute(f"SELECT id FROM {metric_table_name}")
-                all_ids = [row[0] for row in cursor.fetchall()]
-                
-                # Randomly sample IDs
-                import random
-                random.seed(42)  # For reproducibility
-                sampled_ids = random.sample(all_ids, sample_size)
-                
-                # Create a string of IDs for the SQL query
-                ids_str = ','.join(str(id) for id in sampled_ids)
-                
-                # Get the sampled data
-                df1 = pd.read_sql(f"SELECT * FROM {metric_table_name} WHERE id IN ({ids_str})", conn)
-            else:
-                # Get all data if it's a small table
-                df1 = pd.read_sql(f"SELECT * FROM {metric_table_name}", conn)
+            # Filter to only include id, main_data_id, and channel columns we care about
+            needed_columns = ['id', 'main_data_id']
+            for col in all_columns:
+                if any(ch in col for ch in CHANNELS) and any(s in col for s in SENSORS):
+                    needed_columns.append(col)
             
-            print(f"Loaded {len(df1)} rows from {metric_table_name}")
+            # Create comma-separated list of columns
+            columns_str = ', '.join(needed_columns)
             
-            # Get corresponding main_data for these IDs
-            ids_str = ','.join(str(id) for id in df1['id'].tolist())
-            try:
-                df = pd.read_sql(
-                    f'SELECT id, time FROM main_data WHERE id IN ({ids_str})',
-                    conn,
-                    parse_dates=['time']
-                )
-                print(f"Loaded {len(df)} rows from main_data")
-            except Exception as e:
-                print(f"Error loading main_data: {str(e)}")
-                # Create a fallback dataframe
-                df = pd.DataFrame({
-                    'id': df1['id'].unique(),
-                    'time': pd.date_range(start='2023-01-01', periods=len(df1['id'].unique()), freq='D')
-                })
+            # Get the metric data with only needed columns
+            df1 = pd.read_sql(f"SELECT {columns_str} FROM {metric_table_name}", conn)
+            print(f"Loaded {len(df1)} rows from {metric_table_name} with {len(needed_columns)} columns")
             
-            # Get corresponding RPM data
-            try:
-                df_rpm = pd.read_sql(
-                    f'SELECT id, ch1s1 FROM rpm WHERE id IN ({ids_str})',
-                    conn
-                )
-                print(f"Loaded {len(df_rpm)} rows from rpm")
-            except Exception as e:
-                print(f"Error loading rpm data: {str(e)}")
-                # Create a fallback dataframe
-                df_rpm = pd.DataFrame({
-                    'id': df1['id'].unique(),
-                    'ch1s1': np.random.uniform(800, 1200, len(df1['id'].unique()))
-                })
+            # Get time data from main_data
+            main_data = pd.read_sql(
+                "SELECT id, time FROM main_data",
+                conn,
+                parse_dates=['time']
+            )
+            print(f"Loaded {len(main_data)} rows from main_data")
+            
+            # Get RPM data (only the columns we need)
+            rpm_data = pd.read_sql(
+                "SELECT main_data_id, ch1s1 FROM rpm",
+                conn
+            )
+            print(f"Loaded {len(rpm_data)} rows from rpm")
             
             # Process columns and convert to float where possible
             for col in df1.columns:
-                if col != 'id' and any(ch in col for ch in CHANNELS):
+                if col not in ['id', 'main_data_id'] and any(ch in col for ch in CHANNELS):
                     try:
                         # Try direct float conversion first
                         df1[col] = pd.to_numeric(df1[col], errors='raise')
@@ -268,18 +244,21 @@ def load_data_cached(metric):
                             print(f"Warning: Could not process column {col}")
                             df1[col] = np.nan
             
-            # Merge dataframes
+            # Merge with main_data to get time information
             merged_df1 = pd.merge(
-                df[['id', 'time']], 
+                main_data[['id', 'time']], 
                 df1, 
-                on='id', 
+                left_on='id',
+                right_on='main_data_id', 
                 how='inner'
             )
             
+            # Merge with RPM data
             merged_df2 = pd.merge(
-                df[['id', 'time']], 
-                df_rpm[['id', 'ch1s1']], 
-                on='id', 
+                main_data[['id', 'time']], 
+                rpm_data, 
+                left_on='id',
+                right_on='main_data_id', 
                 how='inner'
             )
             
@@ -287,10 +266,34 @@ def load_data_cached(metric):
             merged_df2['ch1s1'] = pd.to_numeric(merged_df2['ch1s1'], errors='coerce')
             
             # Clean up to save memory
-            del df, df1, df_rpm
+            del df1, main_data, rpm_data
+            gc.collect()
+            
+            # Sort by time
+            merged_df1 = merged_df1.sort_values('time')
+            merged_df2 = merged_df2.sort_values('time')
+            
+            # Calculate MA7 for all sensor columns and KEEP ONLY THE MA7 VALUES
+            ma7_df = pd.DataFrame({'time': merged_df1['time'], 'id': merged_df1['id']})
+            
+            for col in merged_df1.columns:
+                if col not in ['id', 'main_data_id', 'time'] and any(ch in col for ch in CHANNELS):
+                    # Calculate MA7
+                    ma7_df[col] = merged_df1[col].rolling(window=7, min_periods=1).mean()
+            
+            # Replace the original dataframe with the MA7 version to save memory
+            del merged_df1
+            merged_df1 = ma7_df
+            
+            # Convert float columns to float32 to save memory
+            for col in merged_df1.select_dtypes(include=['float64']).columns:
+                merged_df1[col] = merged_df1[col].astype('float32')
+            
+            for col in merged_df2.select_dtypes(include=['float64']).columns:
+                merged_df2[col] = merged_df2[col].astype('float32')
             
             # Limit cache size
-            if len(data_cache) >= 3:  # Only keep 3 metrics in memory
+            if len(data_cache) >= 2:  # Only keep 2 metrics in memory
                 oldest_key = next(iter(data_cache))
                 del data_cache[oldest_key]
                 print(f"Removed {oldest_key} from cache to save memory")
@@ -300,6 +303,9 @@ def load_data_cached(metric):
             
             print(f"Data load completed in {time.time() - start_time:.2f} seconds")
             print(f"Final data size: {len(merged_df1)} rows")
+            
+            # Force garbage collection
+            gc.collect()
             
             return merged_df1, merged_df2
             
