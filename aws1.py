@@ -1,40 +1,23 @@
-import gc
-import os
-import sys
-from datetime import datetime
-import requests  # Add requests for downloading
-import json
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output, State
+from dash.exceptions import PreventUpdate
 import sqlite3
-import time
 import pandas as pd
+import os
+import plotly.express as px
 import numpy as np
-import flask
-import dash
-from dash import dcc, html, callback, Input, Output, State
 import plotly.graph_objects as go
-import tempfile
-
-# Force garbage collection at startup
-gc.collect()
-
-# Set lower memory limits for pandas
-pd.options.mode.chained_assignment = None  # default='warn'
-
-# Only import what you absolutely need
-import numpy as np
-import flask
-import dash
-from dash import dcc, html, callback, Input, Output, State
-import plotly.graph_objects as go
-import sqlite3
-import json
-import tempfile
+from datetime import datetime, timedelta
+from functools import lru_cache
 import time
-
-# Initialize data cache
-data_cache = {}
-db_loaded = False
-all_tables = {}
+import json
+import math
+import boto3
+import tempfile
+import os.path
+from botocore import UNSIGNED
+from botocore.client import Config
 
 # Constants
 AVAILABLE_METRICS = ['std_dev', 'rms', 'iqr', 'clean_max', 'clean_min', 'clean_range', 
@@ -64,228 +47,136 @@ TRANSFORMATIONS = [
     {'label': 'Decimal Scale', 'value': 'decimal'}
 ]
 
-# AWS Configuration
-# Define your bucket name and S3 object details
-S3_BUCKET = 'public-tarucca-db'
-S3_REGION = 'eu-central-1'
-S3_DB_URL = f'https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/text.db'
+# S3 configuration
+S3_BUCKET = "public-tarucca-db"
+S3_KEY = "text.db"
 
-# Initialize S3 client
-s3 = None
-try:
-    # Initialize S3 client without credentials for public bucket
-    s3 = boto3.client(
-        "s3",
-        region_name=S3_REGION,
-        config=Config(
-            connect_timeout=5,
-            read_timeout=300,
-            retries={'max_attempts': 3}
-        )
-    )
-    # Test the connection by listing objects (should work for public buckets)
-    s3.list_objects_v2(Bucket=S3_BUCKET, MaxKeys=1)
-    print("AWS S3 connection verified successfully")
-except Exception as e:
-    print(f"AWS Configuration Error: {str(e)}")
-    s3 = None
-
-# Function to load all tables from the database once
-def load_database():
-    """Load all tables from the database once"""
-    global db_loaded, all_tables
-    
-    if db_loaded:
-        return True
-    
-    start_time = time.time()
-    
+# Function to get database file from S3
+def get_db_file():
+    """Download the database file from S3 to a temporary file"""
     try:
-        print("Loading database tables...")
+        # Create a temporary file that will be deleted when closed
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        temp_file_path = temp_file.name
+        temp_file.close()
         
-        # Create a temporary directory for the database file
-        temp_dir = os.path.join(tempfile.gettempdir(), 'dashboard_db')
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_db_path = os.path.join(temp_dir, 'text.db')
+        print(f"Downloading database from S3: {S3_BUCKET}/{S3_KEY}")
         
-        # Download the database file from S3 if not already downloaded
-        if not os.path.exists(temp_db_path):
-            print(f"Downloading database from {S3_DB_URL}")
-            response = requests.get(S3_DB_URL, stream=True)
-            response.raise_for_status()  # Raise an exception for HTTP errors
-            
-            with open(temp_db_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            print(f"Database downloaded successfully to {temp_db_path}")
-        else:
-            print(f"Using existing database file at {temp_db_path}")
+        # Create an S3 client with unsigned config for public bucket access
+        s3_client = boto3.client(
+            's3',
+            region_name='eu-central-1',
+            config=Config(signature_version=UNSIGNED)
+        )
         
-        # Connect to the database
-        conn = sqlite3.connect(temp_db_path)
-        
-        # List tables in the database
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [row[0] for row in cursor.fetchall()]
-        print(f"Available tables in database: {tables}")
-        
-        # Load all tables into memory
-        for table in tables:
-            try:
-                all_tables[table.lower()] = pd.read_sql(f"SELECT * FROM {table}", conn)
-                print(f"Loaded table {table} with {len(all_tables[table.lower()])} rows")
-            except Exception as e:
-                print(f"Error loading table {table}: {str(e)}")
-        
-        conn.close()
-        db_loaded = True
-        print(f"Database loading completed in {time.time() - start_time:.2f} seconds")
-        return True
+        # Download the file
+        s3_client.download_file(S3_BUCKET, S3_KEY, temp_file_path)
+        print(f"Database downloaded successfully to temporary file")
+        return temp_file_path
         
     except Exception as e:
-        print(f"Error loading database: {str(e)}")
-        return False
+        print(f"Error downloading database from S3: {str(e)}")
+        raise
 
-# Update the load_data_cached function with more aggressive memory optimization
+# Add caching decorator to load_data function
+@lru_cache(maxsize=1)
 def load_data_cached(metric):
-    """Load data with caching to improve performance"""
-    if metric in data_cache:
-        return data_cache[metric]
-    
     try:
         start_time = time.time()
         print(f"Starting data load for {metric}...")
         
-        # Download database if needed
-        download_database()
+        # Get database file from S3
+        db_path = get_db_file()
         
-        # Use local database file
-        db_path = "archive/DB/text.db"
-        if not os.path.exists(db_path):
-            print(f"Database not found at {db_path}")
-            return None, None
-        
-        # Connect to the database
+        # Create connection and read data efficiently
         with sqlite3.connect(db_path) as conn:
-            # Find the table name with case-insensitive matching
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in cursor.fetchall()]
-            print(f"Available tables in database: {tables}")
+            # First, get the column names from the metric table
+            columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
+            metric_columns = columns_df['name'].tolist()
             
-            metric_table_name = None
-            for table in tables:
-                if table.lower() == metric.lower():
-                    metric_table_name = table
-                    break
+            # Read only necessary columns
+            df = pd.read_sql(
+                'SELECT id, time FROM main_data',
+                conn,
+                parse_dates=['time']
+            )
             
-            if not metric_table_name:
-                # Try with capitalization variations
-                for table in tables:
-                    if table.lower().replace('_', '') == metric.lower().replace('_', ''):
-                        metric_table_name = table
-                        break
+            # Read RPM data
+            df_rpm = pd.read_sql(
+                'SELECT id, ch1s1 FROM rpm',
+                conn
+            )
             
-            if not metric_table_name:
-                # Try with "std_Dev" for "std_dev"
-                if metric.lower() == "std_dev":
-                    for table in tables:
-                        if table.lower() == "std_dev" or table == "std_Dev":
-                            metric_table_name = table
-                            break
+            # Read metric data without type casting first
+            df1 = pd.read_sql(f'SELECT * FROM {metric}', conn)
             
-            if not metric_table_name:
-                raise ValueError(f"Table for metric {metric} not found in database")
-            
-            print(f"Using table {metric_table_name} for metric {metric}")
-            
-            # Get only the columns we need
-            # First, get all column names
-            cursor.execute(f"PRAGMA table_info({metric_table_name})")
-            all_columns = [row[1] for row in cursor.fetchall()]
-            
-            # Select only the columns we need
-            needed_columns = ['id', 'main_data_id', 'time']
-            for ch in CHANNELS:
-                for s in SENSORS:
-                    col = f"{ch}{s}"
-                    if col in all_columns:
-                        needed_columns.append(col)
-            
-            # Convert list to comma-separated string
-            columns_str = ', '.join(needed_columns)
-            
-            # Load data with limit
-            query = f"SELECT {columns_str} FROM {metric_table_name} LIMIT 10000"
-            df1 = pd.read_sql_query(query, conn)
-            print(f"Loaded data from {metric_table_name} table")
-            
-            # Load RPM data
-            rpm_table = None
-            for table in tables:
-                if table.lower() == 'rpm':
-                    rpm_table = table
-                    break
-            
-            if not rpm_table:
-                raise ValueError("RPM table not found in database")
-            
-            # Load RPM data with limit
-            query = f"SELECT id, ch1s1, ch2s1, ch3s1, ch4s1 FROM {rpm_table} LIMIT 10000"
-            df2 = pd.read_sql_query(query, conn)
-            print(f"Loaded RPM data from {rpm_table} table")
-            
-            # Check for corruption status table
-            corruption_table = None
-            for table in tables:
-                if table.lower() == 'corruption_status':
-                    corruption_table = table
-                    break
-            
-            if corruption_table:
-                # Load corruption data
-                query = f"SELECT * FROM {corruption_table} LIMIT 10000"
-                corruption_df = pd.read_sql_query(query, conn)
+            # Read corruption status data
+            try:
+                corruption_df = pd.read_sql(
+                    'SELECT * FROM corruption_status',
+                    conn
+                )
                 
-                # Set corrupted values to NaN
-                if 'main_data_id' in df1.columns and 'main_data_id' in corruption_df.columns:
-                    corrupted_ids = corruption_df[corruption_df['is_corrupted'] == 1]['main_data_id'].tolist()
-                    for col in df1.columns:
-                        if col not in ['id', 'main_data_id', 'time']:
-                            mask = df1['main_data_id'].isin(corrupted_ids)
-                            if mask.any():
-                                print(f"Set {mask.sum()} corrupted values to NaN for {col}")
-                                df1.loc[mask, col] = np.nan
-        
-        # Convert time column to datetime
-        if 'time' in df1.columns:
-            df1['time'] = pd.to_datetime(df1['time'])
-        
-        # Convert float64 to float32 to save memory
-        for col in df1.columns:
-            if df1[col].dtype == 'float64':
-                df1[col] = df1[col].astype('float32')
-        
-        for col in df2.columns:
-            if df2[col].dtype == 'float64':
-                df2[col] = df2[col].astype('float32')
-        
-        # Store in cache
-        data_cache[metric] = (df1, df2)
-        
-        print(f"Data load completed in {time.time() - start_time:.2f} seconds")
-        print(f"Loaded {len(df1)} rows")
-        
-        return df1, df2
-    
+                # For each channel-sensor combination in the metric data
+                for col in df1.columns:
+                    if col != 'id' and any(ch in col for ch in CHANNELS):
+                        # If this column exists in corruption_status
+                        if col in corruption_df.columns:
+                            # Get IDs where this channel-sensor is corrupted
+                            corrupted_ids = corruption_df[corruption_df[col] == 1]['id'].tolist()
+                            
+                            # Set the corresponding values in the metric data to NaN
+                            df1.loc[df1['id'].isin(corrupted_ids), col] = np.nan
+                            
+                            print(f"Set {len(corrupted_ids)} corrupted values to NaN for {col}")
+                
+            except Exception as e:
+                print(f"Warning: Could not apply corruption filtering: {str(e)}")
+            
+            # Process JSON columns and convert to float where possible
+            for col in df1.columns:
+                if col != 'id' and any(ch in col for ch in CHANNELS):
+                    try:
+                        # Try direct float conversion first
+                        df1[col] = pd.to_numeric(df1[col], errors='raise')
+                    except ValueError:
+                        try:
+                            # If that fails, try to extract 'magnitude' from JSON
+                            df1[col] = df1[col].apply(lambda x: json.loads(x)['magnitude'] 
+                                                    if isinstance(x, str) and x.startswith('{') 
+                                                    else x)
+                            df1[col] = pd.to_numeric(df1[col], errors='coerce')
+                        except:
+                            print(f"Warning: Could not process column {col}")
+                            df1[col] = np.nan
+            
+            # Merge dataframes
+            merged_df1 = pd.merge(
+                df[['id', 'time']], 
+                df1, 
+                on='id', 
+                how='inner'
+            )
+            merged_df2 = pd.merge(
+                df[['id', 'time']], 
+                df_rpm[['id', 'ch1s1']], 
+                on='id', 
+                how='inner'
+            )
+            
+            # Convert RPM column to float
+            merged_df2['ch1s1'] = pd.to_numeric(merged_df2['ch1s1'], errors='coerce')
+            
+            del df, df1, df_rpm
+            
+            print(f"Data load completed in {time.time() - start_time:.2f} seconds")
+            print(f"Loaded {len(merged_df1)} rows after filtering")
+            return merged_df1, merged_df2
+            
     except Exception as e:
-        import traceback
-        print(f"Error loading data: {str(e)}")
-        print(traceback.format_exc())
-        return None, None
-
+        print(f"Error loading data from local database: {str(e)}")
+        raise
+    
 # Calculate default y-limits
 def calculate_y_limits(df, channels, sensors):
     all_values = []
@@ -294,11 +185,7 @@ def calculate_y_limits(df, channels, sensors):
             col = f'{ch}{s}'
             if col in df.columns:
                 all_values.extend(df[col].dropna().values)
-    
-    if all_values:
-        return np.percentile(all_values, [2.5, 97.5])
-    else:
-        return [0, 10]  # Default if no values
+    return np.percentile(all_values, [2.5, 97.5]) if all_values else (0, 1)
 
 # Function to apply data transformations
 def apply_transformation(df, transform_type, columns):
@@ -349,144 +236,9 @@ def apply_transformation(df, transform_type, columns):
                     transform_description = "Decimal Scaled"
     
     return transformed_df, transform_description
-
-def apply_baseline_adjustment(df, time_col='time'):
-    """Apply baseline adjustment between consecutive periods"""
-    adjusted_df = df.copy()
-    adjustments = {}
-    
-    try:
-        # Sort periods chronologically
-        sorted_periods = sorted(COMPARISON_PERIODS.items(), 
-                               key=lambda x: pd.to_datetime(x[1][0]))
-        
-        # Process each pair of consecutive periods
-        for i in range(len(sorted_periods) - 1):
-            current_period_name, current_period = sorted_periods[i]
-            next_period_name, next_period = sorted_periods[i+1]
-            
-            # Convert string dates to datetime objects
-            current_period_end = pd.to_datetime(current_period[1])
-            next_period_start = pd.to_datetime(next_period[0])
-            
-            print(f"Adjusting between {current_period_name} (ending {current_period[1]}) and {next_period_name} (starting {next_period[0]})")
-            
-            # Define date ranges for comparison (5 days before/after boundary)
-            current_end_range_start = current_period_end - pd.Timedelta(days=5)
-            next_start_range_end = next_period_start + pd.Timedelta(days=5)
-            
-            # Calculate adjustment factors for each column
-            for col in adjusted_df.columns:
-                # Skip time, id columns, and only process columns that contain channel names
-                if col in ['time', 'id'] or not any(ch in col for ch in CHANNELS):
-                    continue
-                
-                try:
-                    # Get data from end of current period
-                    current_end_mask = (adjusted_df[time_col] >= current_end_range_start) & (adjusted_df[time_col] <= current_period_end)
-                    current_end_data = adjusted_df.loc[current_end_mask, col].dropna()
-                    
-                    # Get data from start of next period
-                    next_start_mask = (adjusted_df[time_col] >= next_period_start) & (adjusted_df[time_col] <= next_start_range_end)
-                    next_start_data = adjusted_df.loc[next_start_mask, col].dropna()
-                    
-                    # Check if we have enough data points
-                    if len(current_end_data) < 3 or len(next_start_data) < 3:
-                        print(f"  Insufficient data for {col} at boundary between {current_period_name} and {next_period_name}")
-                        continue
-                    
-                    # Calculate means for both periods
-                    current_end_mean = current_end_data.mean()
-                    next_start_mean = next_start_data.mean()
-                    
-                    # Calculate adjustment (difference between means)
-                    adjustment = current_end_mean - next_start_mean
-                    
-                    # Only apply significant adjustments (more than 5% of data range)
-                    data_range = adjusted_df[col].max() - adjusted_df[col].min()
-                    if abs(adjustment) > 0.05 * data_range:
-                        # Apply adjustment to all data points in the next period and beyond
-                        future_mask = adjusted_df[time_col] >= next_period_start
-                        adjusted_df.loc[future_mask, col] = adjusted_df.loc[future_mask, col] + adjustment
-                        
-                        # Store the adjustment for reference
-                        adjustment_key = f"{current_period_name}-{next_period_name}_{col}"
-                        adjustments[adjustment_key] = adjustment
-                except Exception as e:
-                    print(f"  Error adjusting {col}: {str(e)}")
-                    continue
-        
-        print(f"Applied baseline adjustments: {adjustments}")
-        return adjusted_df, adjustments
-    
-    except Exception as e:
-        print(f"Error in baseline adjustment: {str(e)}")
-        return df, {}  # Return original data if adjustment fails
-
-def apply_data_transformation(df, transform_type):
-    """Apply various data transformations to the dataframe."""
-    # Create a copy to avoid modifying the original
-    transformed_df = df.copy()
-    transform_description = "No Transformation"
-    
-    # Get all sensor columns
-    sensor_cols = [col for col in df.columns if col not in ['id', 'time']]
-    
-    if transform_type != 'none':
-        for col in sensor_cols:
-            try:
-                # Skip columns with non-numeric data or all NaN values
-                if not pd.api.types.is_numeric_dtype(df[col]) or df[col].isna().all():
-                    continue
-                    
-                # Apply the selected transformation
-                if transform_type == 'log':
-                    # Add a small constant to avoid log(0)
-                    min_val = transformed_df[col].min()
-                    offset = 0 if min_val > 0 else abs(min_val) + 1
-                    transformed_df[col] = np.log(transformed_df[col] + offset)
-                    transform_description = "Log Transformed"
-                
-                elif transform_type == 'z_score':
-                    mean = transformed_df[col].mean()
-                    std = transformed_df[col].std()
-                    if std > 0:  # Avoid division by zero
-                        transformed_df[col] = (transformed_df[col] - mean) / std
-                    transform_description = "Z-Score Normalized"
-                
-                elif transform_type == 'min_max':
-                    min_val = transformed_df[col].min()
-                    max_val = transformed_df[col].max()
-                    range_val = max_val - min_val
-                    if range_val > 0:  # Avoid division by zero
-                        transformed_df[col] = (transformed_df[col] - min_val) / range_val
-                    transform_description = "Min-Max Scaled (0-1)"
-                
-                elif transform_type == 'robust':
-                    median = transformed_df[col].median()
-                    q1 = transformed_df[col].quantile(0.25)
-                    q3 = transformed_df[col].quantile(0.75)
-                    iqr = q3 - q1
-                    if iqr > 0:  # Avoid division by zero
-                        transformed_df[col] = (transformed_df[col] - median) / iqr
-                    transform_description = "Robust Scaled (IQR)"
-                
-                elif transform_type == 'decimal':
-                    max_abs = max(abs(transformed_df[col].max()), abs(transformed_df[col].min()))
-                    if max_abs > 0:  # Avoid division by zero
-                        scale = 10 ** math.floor(math.log10(max_abs))
-                        transformed_df[col] = transformed_df[col] / scale
-                    transform_description = "Decimal Scaled"
-            except Exception as e:
-                print(f"Error transforming column {col}: {str(e)}")
-                # Keep the original values for this column
-                transformed_df[col] = df[col]
-    
-    return transformed_df, transform_description
-
 def apply_sigma_filter_and_smooth(df, column, sigma_threshold=2.0, window_size=7, poly_order=3):
     """
-    Apply a sigma filter to remove outliers and then smooth the data with Savitzky-Golay
+    Apply a sigma filter to remove outliers and then smooth the data with LOWESS or Savitzky-Golay
     
     Parameters:
     -----------
@@ -528,60 +280,96 @@ def apply_sigma_filter_and_smooth(df, column, sigma_threshold=2.0, window_size=7
     
     return filtered_series, smoothed_series
 
-# Memory management function
-def manage_memory():
-    """Print memory usage and clear cache if needed"""
-    import psutil
-    import gc
+def apply_baseline_adjustment(df, time_col='time'):
+    """Apply baseline adjustment between consecutive periods"""
+    adjusted_df = df.copy()
+    adjustments = {}
     
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    memory_mb = memory_info.rss / (1024 * 1024)
-    
-    print(f"Current memory usage: {memory_mb:.2f} MB")
-    
-    # If memory usage is high, clear cache
-    if memory_mb > 400:  # 400MB threshold
-        global data_cache
-        data_cache.clear()
-        gc.collect()
-        print("Memory usage high - cleared cache and ran garbage collection")
+    try:
+        # Sort periods chronologically
+        sorted_periods = sorted(COMPARISON_PERIODS.items(), 
+                               key=lambda x: pd.to_datetime(x[1][0]))
         
-        # Print new memory usage
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / (1024 * 1024)
-        print(f"New memory usage: {memory_mb:.2f} MB")
+        # Process each pair of consecutive periods
+        for i in range(len(sorted_periods) - 1):
+            current_period_name, current_period = sorted_periods[i]
+            next_period_name, next_period = sorted_periods[i+1]
+            
+            # Convert string dates to datetime objects
+            current_period_end = pd.to_datetime(current_period[1])
+            next_period_start = pd.to_datetime(next_period[0])
+            
+            print(f"Adjusting between {current_period_name} (ending {current_period[1]}) and {next_period_name} (starting {next_period[0]})")
+            
+            # Define date ranges for comparison (5 days before/after boundary)
+            current_end_range_start = current_period_end - pd.Timedelta(days=5)
+            next_start_range_end = next_period_start + pd.Timedelta(days=5)
+            
+            # Calculate adjustment factors for each column
+            for col in adjusted_df.columns:
+                # Skip time, id columns, and only process columns that contain channel names
+                if col not in [time_col, 'id', 'main_data_id'] and any(ch in col for ch in CHANNELS):
+                    try:
+                        # Ensure column is numeric
+                        if not pd.api.types.is_numeric_dtype(adjusted_df[col]):
+                            adjusted_df[col] = pd.to_numeric(adjusted_df[col], errors='coerce')
+                        
+                        # Create masks for the date ranges
+                        current_end_mask = (adjusted_df[time_col] >= current_end_range_start) & (adjusted_df[time_col] <= current_period_end)
+                        next_start_mask = (adjusted_df[time_col] >= next_period_start) & (adjusted_df[time_col] <= next_start_range_end)
+                        
+                        # Get data for the ranges
+                        current_end_data = adjusted_df.loc[current_end_mask, col].dropna()
+                        next_start_data = adjusted_df.loc[next_start_mask, col].dropna()
+                        
+                        if not current_end_data.empty and not next_start_data.empty:
+                            # Calculate average values at the boundary
+                            current_end_avg = current_end_data.mean()
+                            next_start_avg = next_start_data.mean()
+                            
+                            # Calculate adjustment (difference between current end and next start)
+                            adjustment = current_end_avg - next_start_avg
+                            
+                            # Only apply significant adjustments (more than 5% of the data range)
+                            data_range = adjusted_df[col].max() - adjusted_df[col].min()
+                            if data_range > 0 and abs(adjustment) > 0.05 * data_range:
+                                adjustments[f"{current_period_name}-{next_period_name}_{col}"] = adjustment
+                                
+                                # Apply adjustment to all data after current period
+                                after_current_mask = adjusted_df[time_col] > current_period_end
+                                adjusted_df.loc[after_current_mask, col] = adjusted_df.loc[after_current_mask, col] + adjustment
+                                
+                                print(f"  Applied adjustment of {adjustment:.4f} to {col} between {current_period_name} and {next_period_name}")
+                            else:
+                                print(f"  Skipped small adjustment of {adjustment:.4f} for {col} (less than 5% of data range)")
+                        else:
+                            print(f"  Insufficient data for {col} at boundary between {current_period_name} and {next_period_name}")
+                    except Exception as col_error:
+                        print(f"Error processing column {col}: {str(col_error)}")
+                        continue
     
-    return memory_mb
+    except Exception as e:
+        print(f"Error in baseline adjustment: {str(e)}")
+        return df, {}
+        
+    return adjusted_df, adjustments
 
-# Initialize the server with a smaller worker class
-server = flask.Flask(__name__)
-app = dash.Dash(__name__, server=server)
+# Initialize Dash app
+app = dash.Dash(__name__)
 
-# Load all database tables at startup
-print("Loading database tables at startup...")
-load_database()
-print("Database loading complete")
-
-# Try to load initial data
+# Load initial data
 try:
-    print("Loading initial data...")
+    print("Loading initial data from local database...")
     initial_df1, initial_df2 = load_data_cached('std_dev')
-    if initial_df1 is None:
-        # Create empty dataframes with the expected structure
-        initial_df1 = pd.DataFrame(columns=['id', 'main_data_id', 'time'] + [f"{ch}{s}" for ch in CHANNELS for s in SENSORS])
-        initial_df1['time'] = pd.to_datetime(initial_df1['time'])
-    print(f"Initial data loaded: {len(initial_df1)} rows")
+    y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
+    # print(f"Initial data loaded: {len(initial_df1)} rows")
 except Exception as e:
     print(f"Error loading initial data: {str(e)}")
-    # Create empty dataframes with the expected structure
-    initial_df1 = pd.DataFrame(columns=['id', 'main_data_id', 'time'] + [f"{ch}{s}" for ch in CHANNELS for s in SENSORS])
-    initial_df1['time'] = pd.to_datetime(initial_df1['time'])
+    initial_df1 = pd.DataFrame(columns=['id', 'time'])
+    initial_df2 = pd.DataFrame(columns=['id', 'time', 'ch1s1'])
+    y_min, y_max = 0, 1
 
 # App Layout
-memory_usage = manage_memory()
-print(f"Memory usage before creating layout: {memory_usage:.2f} MB")
-
 app.layout = html.Div([
     html.H1("Sensor Data Analysis Dashboard"),
     
@@ -685,8 +473,8 @@ app.layout = html.Div([
     
     html.Div([
         html.Label('Y-axis Range'),
-        dcc.Input(id='y-min-input', type='number', value=initial_df1['std_dev'].min(), placeholder='Min Y'),
-        dcc.Input(id='y-max-input', type='number', value=initial_df1['std_dev'].max(), placeholder='Max Y'),
+        dcc.Input(id='y-min-input', type='number', value=y_min, placeholder='Min Y'),
+        dcc.Input(id='y-max-input', type='number', value=y_max, placeholder='Max Y'),
         html.Button('Auto Scale', id='auto-scale-button', n_clicks=0),
     ], style={'padding': '10px'}),
     
@@ -711,7 +499,7 @@ app.layout = html.Div([
     # Add initial loading message
     html.Div(
         id='initial-loading',
-        children='Loading data... This may take a few minutes on first load.',
+        children='Loading data from local database...',
         style={
             'textAlign': 'center',
             'padding': '20px',
@@ -727,17 +515,15 @@ app.layout = html.Div([
     [Input('metric-dropdown', 'value'),
      Input('sensor-dropdown', 'value'),
      Input('channel-dropdown', 'value'),
-     Input('rpm-range-slider', 'value'),
+     Input('rpm-range-slider', 'value'),  # Changed from 'rpm-dropdown' to 'rpm-range-slider'
      Input('date-picker', 'start_date'),
      Input('date-picker', 'end_date'),
      Input('y-min-input', 'value'),
      Input('y-max-input', 'value'),
-     Input('ma-slider', 'value'),
-     Input('transform-dropdown', 'value'),
-     Input('baseline-radio', 'value')]
+     Input('ma-slider', 'value')]
 )
 def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range, 
-                start_date, end_date, y_min, y_max, ma_days, transform_type, baseline_option):
+                start_date, end_date, y_min, y_max, ma_days):
     try:
         if not all([selected_metric, selected_sensor, selected_channels]):
             raise PreventUpdate
@@ -789,20 +575,10 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
             )
             return empty_fig, "No data available for the selected filters"
         
-        # Apply baseline adjustment if selected
-        baseline_text = "Raw Data"
-        if baseline_option == 'adjusted':
-            final_df, adjustments = apply_baseline_adjustment(final_df)
-            if adjustments:
-                print(f"Applied baseline adjustments: {adjustments}")
-            baseline_text = "Baseline Adjusted"
-        
-        # Apply transformation if selected
-        transform_description = "No Transformation"
-        if transform_type != 'none':
-            # Get all columns to transform
-            columns_to_transform = [f'{ch}{selected_sensor}' for ch in selected_channels]
-            final_df, transform_description = apply_transformation(final_df, transform_type, columns_to_transform)
+        # Apply baseline adjustment
+        final_df, adjustments = apply_baseline_adjustment(final_df)
+        if adjustments:
+            print(f"Applied baseline adjustments: {adjustments}")
         
         # Create figure
         fig = go.Figure()
@@ -903,12 +679,7 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
             )
         
         # Update layout
-        title_text = f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor}'
-        if baseline_option == 'adjusted':
-            title_text += ' (Baseline Adjusted)'
-        if transform_type != 'none':
-            title_text += f' ({transform_description})'
-            
+        title_text = f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor} (Baseline Adjusted)'
         rpm_text = f"RPM Range: {rpm_min}-{rpm_max}"
             
         fig.update_layout(
@@ -928,12 +699,8 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
         )
         
         # Add note about data processing
-        processing_note = f"{baseline_text} | {rpm_text} | Sigma-filtered (2σ) with Savitzky-Golay smoothing"
-        if transform_type != 'none':
-            processing_note += f" | {transform_description}"
-            
         fig.add_annotation(
-            text=processing_note,
+            text=f"Baseline Adjusted | {rpm_text} | Sigma-filtered (2σ) with Savitzky-Golay smoothing",
             xref="paper", yref="paper",
             x=0.5, y=-0.15,
             showarrow=False,
@@ -959,7 +726,7 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
                 y=0.5
             )]
         )
-        return empty_fig, f"Error: {str(e)}"
+        return empty_fig, f"Error: {str(e)}"   
 
 @app.callback(
     [Output('y-min-input', 'value'),
@@ -989,279 +756,16 @@ def update_y_axis_range(n_clicks, metric, sensor, channels):
     except:
         return None, None
 
-def log_memory(label):
-    """Log current memory usage"""
-    try:
-        import psutil
-        process = psutil.Process(os.getpid())
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / (1024 * 1024)
-        print(f"MEMORY ({label}): {memory_mb:.2f} MB")
-        return memory_mb
-    except:
-        print(f"MEMORY ({label}): Unable to check")
-        return 0
-
-# Add these calls at key points:
-log_memory("Application start")
-# Before data loading
-log_memory("Before loading data")
-# After database connection
-log_memory("After DB connection")
-# After loading main_data
-log_memory("After loading main_data")
-# After loading rpm
-log_memory("After loading rpm")
-# After loading metric
-log_memory("After loading metric")
-# After merging
-log_memory("After merging tables")
-# After MA7 calculation
-log_memory("After MA7 calculation")
-# After cleanup
-log_memory("After cleanup")
-# Before visualization
-log_memory("Before creating figure")
-# After visualization
-log_memory("After creating figure")
-
-def memory_checkpoint(threshold_mb=400, label=""):
-    """Check memory and force cleanup if above threshold"""
-    memory_mb = log_memory(f"Checkpoint: {label}")
-    if memory_mb > threshold_mb:
-        print(f"Memory threshold exceeded ({memory_mb:.2f} MB > {threshold_mb} MB). Forcing cleanup.")
-        global data_cache
-        # Clear all caches
-        data_cache.clear()
-        # Force garbage collection
-        gc.collect()
-        log_memory(f"After forced cleanup: {label}")
-    return memory_mb
-
-# Check memory at startup
-check_memory("Startup")
-
-# Minimal server initialization
-server = flask.Flask(__name__)
-app = dash.Dash(__name__, server=server)
-
-# Check memory after server init
-check_memory("After server init")
-
-# Extremely minimal layout
-app.layout = html.Div([
-    html.H1("Dashboard", style={'textAlign': 'center'}),
-    html.Div([
-        html.Label("Select Metric:"),
-        dcc.Dropdown(
-            id='metric-dropdown',
-            options=[
-                {'label': 'RMS', 'value': 'rms'},
-                {'label': 'Average', 'value': 'average_dx'},
-                {'label': 'Standard Deviation', 'value': 'std_Dev'}
-            ],
-            value='rms'
-        ),
-    ], style={'width': '30%', 'display': 'inline-block'}),
+if __name__ == "__main__":
+    # Get port from environment variable or use default
+    port = int(os.environ.get('PORT', 8056))
     
-    html.Div(id='loading-div', children=[
-        html.Div("Select options and click 'Load Data' to view data"),
-        html.Button('Load Data', id='load-button', n_clicks=0)
-    ]),
+    # Get host from environment variable or use default
+    host = os.environ.get('HOST', '0.0.0.0')
     
-    html.Div(id='graph-container', style={'display': 'none'}, children=[
-        dcc.Graph(id='time-series-graph')
-    ])
-])
-
-# Simplified data loading function
-def load_data_minimal(metric, max_rows=5000):
-    """Load minimal data for visualization"""
-    check_memory(f"Before loading {metric}")
-    
-    try:
-        # Clear any existing cache
-        global data_cache
-        data_cache.clear()
-        gc.collect()
-        
-        # Connect to local database
-        db_path = "archive/DB/text.db"
-        if not os.path.exists(db_path):
-            print(f"Database not found at {db_path}")
-            return None, None
-        
-        conn = sqlite3.connect(db_path)
-        
-        # Get only essential columns from main_data
-        main_data = pd.read_sql(
-            "SELECT id, time FROM main_data LIMIT ?", 
-            conn, 
-            params=(max_rows,),
-            parse_dates=['time']
-        )
-        check_memory("After loading main_data")
-        
-        # Get only essential columns from rpm
-        rpm_data = pd.read_sql(
-            "SELECT main_data_id, ch1s1 FROM rpm LIMIT ?", 
-            conn,
-            params=(max_rows,)
-        )
-        check_memory("After loading rpm")
-        
-        # Find the metric table
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", 
-                      (f"%{metric}%",))
-        tables = cursor.fetchall()
-        
-        if not tables:
-            print(f"No table found matching {metric}")
-            conn.close()
-            return None, None
-        
-        metric_table = tables[0][0]
-        
-        # Get column names
-        cursor.execute(f"PRAGMA table_info({metric_table})")
-        all_columns = [row[1] for row in cursor.fetchall()]
-        
-        # Select only essential columns
-        needed_columns = ['id', 'main_data_id']
-        sensor_columns = []
-        
-        # Only get a few sensor columns to save memory
-        for col in all_columns:
-            if col.startswith('ch1s') and len(sensor_columns) < 3:
-                needed_columns.append(col)
-                sensor_columns.append(col)
-        
-        # Load limited data with only needed columns
-        columns_str = ', '.join(needed_columns)
-        metric_data = pd.read_sql(
-            f"SELECT {columns_str} FROM {metric_table} LIMIT ?", 
-            conn,
-            params=(max_rows,)
-        )
-        check_memory(f"After loading {metric_table}")
-        
-        # Convert to numeric
-        for col in sensor_columns:
-            try:
-                metric_data[col] = pd.to_numeric(metric_data[col], errors='coerce')
-            except:
-                print(f"Could not convert {col} to numeric")
-        
-        # Join with time data
-        merged_df = pd.merge(
-            main_data[['id', 'time']], 
-            metric_data,
-            left_on='id', 
-            right_on='main_data_id',
-            how='inner'
-        )
-        
-        # Join with rpm data
-        rpm_merged = pd.merge(
-            main_data[['id', 'time']], 
-            rpm_data,
-            left_on='id', 
-            right_on='main_data_id',
-            how='inner'
-        )
-        
-        # Clean up to save memory
-        del main_data, metric_data, rpm_data
-        gc.collect()
-        check_memory("After merging and cleanup")
-        
-        # Calculate MA7 and keep only that
-        ma7_df = pd.DataFrame({'time': merged_df['time']})
-        
-        for col in sensor_columns:
-            ma7_df[col] = merged_df[col].rolling(window=7, min_periods=1).mean()
-        
-        # Convert to float32
-        for col in ma7_df.columns:
-            if ma7_df[col].dtype == 'float64':
-                ma7_df[col] = ma7_df[col].astype('float32')
-        
-        # Clean up
-        del merged_df
-        gc.collect()
-        check_memory("After MA7 calculation")
-        
-        conn.close()
-        return ma7_df, rpm_merged
-        
-    except Exception as e:
-        print(f"Error loading data: {str(e)}")
-        return None, None
-
-# Simplified callback
-@app.callback(
-    [Output('graph-container', 'style'),
-     Output('time-series-graph', 'figure'),
-     Output('loading-div', 'children')],
-    [Input('load-button', 'n_clicks')],
-    [State('metric-dropdown', 'value')]
-)
-def update_graph(n_clicks, metric):
-    if n_clicks == 0:
-        return {'display': 'none'}, {}, [
-            html.Div("Select options and click 'Load Data' to view data"),
-            html.Button('Load Data', id='load-button', n_clicks=0)
-        ]
-    
-    # Show loading message
-    loading_message = html.Div("Loading data... please wait")
-    
-    # Load data with strict row limit
-    df, rpm_df = load_data_minimal(metric, max_rows=2000)
-    
-    if df is None or len(df) == 0:
-        return {'display': 'none'}, {}, [
-            html.Div("Error loading data. Please try again."),
-            html.Button('Retry', id='load-button', n_clicks=0)
-        ]
-    
-    # Create a simple figure
-    fig = go.Figure()
-    
-    # Add only a few traces to save memory
-    for col in df.columns:
-        if col != 'time' and len(fig.data) < 3:  # Limit to 3 traces
-            fig.add_trace(go.Scatter(
-                x=df['time'], 
-                y=df[col],
-                mode='lines',
-                name=col
-            ))
-    
-    # Simple layout
-    fig.update_layout(
-        title=f"{metric.capitalize()} Time Series",
-        xaxis_title="Time",
-        yaxis_title="Value",
-        height=500
+    # Run the server with specified host and port
+    app.run_server(
+        host=host,
+        port=port,
+        debug=True
     )
-    
-    # Force cleanup
-    check_memory("Before returning figure")
-    
-    return {'display': 'block'}, fig, [
-        html.Div("Data loaded successfully"),
-        html.Button('Refresh Data', id='load-button', n_clicks=0)
-    ]
-
-# Add this at the end
-if __name__ == '__main__':
-    # Check memory before running server
-    check_memory("Before run_server")
-    
-    # Get port from environment variable
-    port = int(os.environ.get('PORT', 8050))
-    
-    # Run with minimal settings
-    app.run_server(debug=False, host='0.0.0.0', port=port)
