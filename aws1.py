@@ -3,6 +3,7 @@ import os
 import sys
 from datetime import datetime
 import requests  # Add requests for downloading
+import psutil  # Add psutil for memory monitoring
 
 # Force garbage collection at startup
 gc.collect()
@@ -10,7 +11,6 @@ gc.collect()
 # Set lower memory limits for pandas
 import pandas as pd
 pd.options.mode.chained_assignment = None  # default='warn'
-pd.options.mode.use_inf_as_na = True
 
 # Only import what you absolutely need
 import numpy as np
@@ -22,7 +22,6 @@ import sqlite3
 import json
 import tempfile
 import time
-import psutil
 
 # Initialize data cache
 data_cache = {}
