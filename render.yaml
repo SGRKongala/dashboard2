@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: sensor-dashboard
+    name: dashboard
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn aws1:server --timeout 120 --workers 1
+    startCommand: gunicorn aws1:server --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.0
@@ -15,5 +15,7 @@ services:
         sync: false
       - key: AWS_SECRET_KEY
         sync: false
+      - key: MALLOC_ARENA_MAX
+        value: "2"
     autoDeploy: false
     plan: starter 
