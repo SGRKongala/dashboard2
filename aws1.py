@@ -209,8 +209,20 @@ def load_data_cached(metric):
             columns_str = ', '.join(needed_columns)
             
             # Get the metric data with only needed columns
-            df1 = pd.read_sql(f"SELECT {columns_str} FROM {metric_table_name}", conn)
-            print(f"Loaded {len(df1)} rows from {metric_table_name} with {len(needed_columns)} columns")
+            chunk_size = 5000
+            chunks = []
+            for chunk in pd.read_sql(f"SELECT {columns_str} FROM {metric_table_name}", conn, chunksize=chunk_size):
+                # Process chunk
+                # ...
+                chunks.append(processed_chunk)
+                # Check memory after each chunk
+                memory_checkpoint(400, f"After processing chunk {len(chunks)}")
+            
+            # Combine chunks if memory allows
+            if len(chunks) > 0:
+                df1 = pd.concat(chunks, ignore_index=True)
+            else:
+                df1 = pd.DataFrame()
             
             # Get time data from main_data
             main_data = pd.read_sql(
@@ -1040,6 +1052,55 @@ def update_y_axis_range(n_clicks, metric, sensor, channels):
         return y_min, y_max
     except:
         return None, None
+
+def log_memory(label):
+    """Log current memory usage"""
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / (1024 * 1024)
+        print(f"MEMORY ({label}): {memory_mb:.2f} MB")
+        return memory_mb
+    except:
+        print(f"MEMORY ({label}): Unable to check")
+        return 0
+
+# Add these calls at key points:
+log_memory("Application start")
+# Before data loading
+log_memory("Before loading data")
+# After database connection
+log_memory("After DB connection")
+# After loading main_data
+log_memory("After loading main_data")
+# After loading rpm
+log_memory("After loading rpm")
+# After loading metric
+log_memory("After loading metric")
+# After merging
+log_memory("After merging tables")
+# After MA7 calculation
+log_memory("After MA7 calculation")
+# After cleanup
+log_memory("After cleanup")
+# Before visualization
+log_memory("Before creating figure")
+# After visualization
+log_memory("After creating figure")
+
+def memory_checkpoint(threshold_mb=400, label=""):
+    """Check memory and force cleanup if above threshold"""
+    memory_mb = log_memory(f"Checkpoint: {label}")
+    if memory_mb > threshold_mb:
+        print(f"Memory threshold exceeded ({memory_mb:.2f} MB > {threshold_mb} MB). Forcing cleanup.")
+        global data_cache
+        # Clear all caches
+        data_cache.clear()
+        # Force garbage collection
+        gc.collect()
+        log_memory(f"After forced cleanup: {label}")
+    return memory_mb
 
 if __name__ == '__main__':
     # Set a very low worker timeout to prevent memory buildup
