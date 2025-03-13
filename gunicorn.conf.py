@@ -1,4 +1,5 @@
 # Gunicorn configuration for memory-constrained environments
+import os
 
 # Worker settings
 workers = 1  # Use only one worker
