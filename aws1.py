@@ -51,6 +51,17 @@ TRANSFORMATIONS = [
 S3_BUCKET = "public-tarucca-db"
 S3_KEY = "text.db"
 
+# Add this to your constants section at the top
+LOG_EVENTS = {
+    '2024-11-24': 'Iver Blade Service stops turbine for visual inspection of M02 turbine',
+    '2024-11-13': 'Iver Blade Service repairs most urgent damage of M02 turbine',
+    '2024-11-14': 'Iver Blade Service repairs most urgent damage of M02 turbine',
+    '2024-11-21': 'Topwind stops M02 turbine due to ice curtailment, 8pm Topwind monitors M02 turbine due to ice ',
+    '2024-11-22': 'Topwind monitors M02 turbine due to ice ',
+    '2025-01-7': 'IVER spotted at M02 for maintenance ',
+    # Add more log events as needed
+}
+
 # Function to get database file from S3
 def get_db_file():
     """Download the database file from S3 to a temporary file"""
@@ -80,10 +91,10 @@ def get_db_file():
 
 # Add caching decorator to load_data function
 @lru_cache(maxsize=1)
-def load_data_cached(metric):
+def load_data_cached(metric, start_date="2024-04-01"):
     try:
         start_time = time.time()
-        print(f"Starting data load for {metric}...")
+        print(f"Starting data load for {metric} from {start_date}...")
         
         # Get database file from S3
         db_path = get_db_file()
@@ -94,21 +105,27 @@ def load_data_cached(metric):
             columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
             metric_columns = columns_df['name'].tolist()
             
-            # Read only necessary columns
+            # Read data with date filter
             df = pd.read_sql(
-                'SELECT id, time FROM main_data',
+                'SELECT id, time FROM main_data WHERE time >= ?',
                 conn,
+                params=(start_date,),
                 parse_dates=['time']
             )
             
-            # Read RPM data
+            # Read RPM data only for the filtered IDs
             df_rpm = pd.read_sql(
-                'SELECT id, ch1s1 FROM rpm',
-                conn
+                'SELECT id, ch1s1 FROM rpm WHERE id IN (SELECT id FROM main_data WHERE time >= ?)',
+                conn,
+                params=(start_date,)
             )
             
-            # Read metric data without type casting first
-            df1 = pd.read_sql(f'SELECT * FROM {metric}', conn)
+            # Read metric data only for the filtered IDs
+            df1 = pd.read_sql(
+                f'SELECT * FROM {metric} WHERE id IN (SELECT id FROM main_data WHERE time >= ?)',
+                conn,
+                params=(start_date,)
+            )
             
             # Read corruption status data
             try:
@@ -372,6 +389,7 @@ except Exception as e:
 
 # App Layout
 app.layout = html.Div([
+    dcc.Store(id='loaded-data-store'),
     html.H1("Sensor Data Analysis Dashboard"),
     
     # Add dropdowns for user input
@@ -427,9 +445,9 @@ app.layout = html.Div([
             html.Label('Date Range'),
             dcc.DatePickerRange(
                 id='date-picker',
-                min_date_allowed=initial_df1['time'].min().date() if not initial_df1.empty else datetime.now().date(),
+                min_date_allowed=datetime(2023, 8, 1),  # Or your earliest data date
                 max_date_allowed=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date(),
-                start_date=initial_df1['time'].min().date() if not initial_df1.empty else datetime.now().date(),
+                start_date=datetime(2024, 4, 1).date(),  # Set initial view to April 2024
                 end_date=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date()
             ),
         ], style={'width': '45%', 'padding': '10px'}),
@@ -510,39 +528,85 @@ app.layout = html.Div([
     )
 ])
 
+# Add a new function to load full date range data
+def load_full_data(metric, start_date=None):
+    """Load data for a specific date range, bypassing the cache if needed"""
+    if start_date is None or start_date >= "2024-04-01":
+        return load_data_cached(metric)
+    else:
+        # Clear the cache if we need older data
+        load_data_cached.cache_clear()
+        return load_data_cached(metric, start_date)
+
+@app.callback(
+    Output('loaded-data-store', 'data'),
+    [Input('metric-dropdown', 'value'),
+     Input('date-picker', 'start_date')]
+)
+def load_and_store_data(selected_metric, start_date):
+    """Load data and store it in the browser"""
+    if not selected_metric:
+        raise PreventUpdate
+        
+    try:
+        # Load data based on selected date range
+        start_dt = pd.to_datetime(start_date)
+        if start_dt.strftime('%Y-%m-%d') < "2024-04-01":
+            merged_df1, merged_df2 = load_full_data(selected_metric, start_dt.strftime('%Y-%m-%d'))
+            print(f"Loading full data range from {start_dt}")
+        else:
+            merged_df1, merged_df2 = load_data_cached(selected_metric)
+            print(f"Using cached data from April 2024")
+            
+        # Convert to dictionary for storage
+        return {
+            'df1': merged_df1.to_dict('records'),
+            'df2': merged_df2.to_dict('records'),
+            'columns1': merged_df1.columns.tolist(),
+            'columns2': merged_df2.columns.tolist()
+        }
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        return None
+
 @app.callback(
     [Output('sensor-graph', 'figure'),
      Output('loading-output', 'children')],
-    [Input('metric-dropdown', 'value'),
+    [Input('loaded-data-store', 'data'),
+     Input('metric-dropdown', 'value'),
      Input('sensor-dropdown', 'value'),
      Input('channel-dropdown', 'value'),
-     Input('rpm-range-slider', 'value'),  # Changed from 'rpm-dropdown' to 'rpm-range-slider'
-     Input('date-picker', 'start_date'),
+     Input('rpm-range-slider', 'value'),
      Input('date-picker', 'end_date'),
      Input('y-min-input', 'value'),
      Input('y-max-input', 'value'),
-     Input('ma-slider', 'value')]
+     Input('ma-slider', 'value'),
+     Input('transform-dropdown', 'value'),
+     Input('baseline-radio', 'value')]
 )
-def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range, 
-                start_date, end_date, y_min, y_max, ma_days):
-    try:
-        if not all([selected_metric, selected_sensor, selected_channels]):
-            raise PreventUpdate
+def update_graph(stored_data, selected_metric, selected_sensor, selected_channels, rpm_range,
+                end_date, y_min, y_max, ma_days, transform_type, baseline_type):
+    """Update visualization using stored data"""
+    if not all([stored_data, selected_metric, selected_sensor, selected_channels]):
+        raise PreventUpdate
 
-        # Load data
-        merged_df1, merged_df2 = load_data_cached(selected_metric)
+    try:
+        # Reconstruct dataframes from stored data
+        merged_df1 = pd.DataFrame.from_records(stored_data['df1'], columns=stored_data['columns1'])
+        merged_df2 = pd.DataFrame.from_records(stored_data['df2'], columns=stored_data['columns2'])
         
-        # Convert dates once
-        start_dt = pd.to_datetime(start_date).date()
+        # Convert time column back to datetime
+        merged_df1['time'] = pd.to_datetime(merged_df1['time'])
+        merged_df2['time'] = pd.to_datetime(merged_df2['time'])
+        
         end_dt = pd.to_datetime(end_date).date()
         
         # Filter by date efficiently
-        mask = (merged_df1['time'].dt.date >= start_dt) & \
-               (merged_df1['time'].dt.date <= end_dt)
+        mask = merged_df1['time'].dt.date <= end_dt
         df_filtered = merged_df1.loc[mask].copy()
         
         # Filter by RPM range efficiently
-        rpm_min, rpm_max = rpm_range  # Using rpm_range from the slider
+        rpm_min, rpm_max = rpm_range
         rpm_mask = (merged_df2['ch1s1'] >= rpm_min) & \
                   (merged_df2['ch1s1'] < rpm_max)
         rpm_filtered = merged_df2.loc[rpm_mask, ['id', 'time']]
@@ -558,44 +622,161 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
         # Sort by time for proper processing
         final_df = final_df.sort_values('time')
         
-        # Clear memory
-        del df_filtered, rpm_filtered
-        
-        if final_df.empty:
-            empty_fig = go.Figure()
-            empty_fig.update_layout(
-                title="No data available for the selected filters",
-                annotations=[dict(
-                    text="No data available for the selected filters",
-                    showarrow=False,
-                    xref="paper",
-                    yref="paper",
-                    x=0.5,
-                    y=0.5
-                )]
-            )
-            return empty_fig, "No data available for the selected filters"
-        
-        # Apply baseline adjustment
-        final_df, adjustments = apply_baseline_adjustment(final_df)
-        if adjustments:
-            print(f"Applied baseline adjustments: {adjustments}")
-        
         # Create figure
         fig = go.Figure()
         
+        # Add period masks first (before data traces)
+        colors = ['rgba(173, 216, 230, 0.2)',  # light blue
+                 'rgba(144, 238, 144, 0.2)',  # light green
+                 'rgba(255, 182, 193, 0.2)',  # light pink
+                 'rgba(255, 218, 185, 0.2)',  # peach
+                 'rgba(221, 160, 221, 0.2)']  # plum
+                 
+        for (period_name, (start_date, end_date)), color in zip(COMPARISON_PERIODS.items(), colors):
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            
+            # Add shaded area for period
+            fig.add_shape(
+                type="rect",
+                x0=start_dt,
+                x1=end_dt,
+                y0=y_min if y_min is not None else 0,
+                y1=y_max if y_max is not None else 1,
+                fillcolor=color,
+                opacity=0.5,
+                layer="below",
+                line_width=0,
+            )
+            
+            # Add period label at the top
+            fig.add_annotation(
+                x=start_dt + (end_dt - start_dt)/2,
+                y=1.05,
+                text=period_name,
+                showarrow=False,
+                xref="x",
+                yref="paper",
+                font=dict(size=10),
+                bgcolor="white",
+                bordercolor=color.replace('0.2', '1.0'),  # Solid color for border
+                borderwidth=1,
+                borderpad=2
+            )
+            
+            # Add vertical lines at period boundaries
+            fig.add_shape(
+                type="line",
+                x0=start_dt,
+                x1=start_dt,
+                y0=0,
+                y1=1,
+                yref="paper",
+                line=dict(color="gray", width=1, dash="dash"),
+                opacity=0.5,
+                layer="below"
+            )
+            fig.add_shape(
+                type="line",
+                x0=end_dt,
+                x1=end_dt,
+                y0=0,
+                y1=1,
+                yref="paper",
+                line=dict(color="gray", width=1, dash="dash"),
+                opacity=0.5,
+                layer="below"
+            )
+
+        # Add log event markers
+        for date, event in LOG_EVENTS.items():
+            event_date = pd.to_datetime(date)
+            
+            # Add vertical dotted line for event
+            fig.add_shape(
+                type="line",
+                x0=event_date,
+                x1=event_date,
+                y0=0,
+                y1=1,
+                yref="paper",
+                line=dict(
+                    color="rgba(255, 0, 0, 0.5)",
+                    width=2,
+                    dash="dot"
+                ),
+                layer="below"
+            )
+            
+            # Add invisible hover target that spans the height of the graph
+            fig.add_trace(go.Scatter(
+                x=[event_date, event_date],
+                y=[0, 1],
+                mode='lines',
+                line=dict(width=0),  # Invisible line
+                hoverinfo='text',
+                hovertext=f"⚡ {date}<br>{event}",
+                showlegend=False,
+                yaxis='y'
+            ))
+            
+            # Add small star marker at the top
+            fig.add_trace(go.Scatter(
+                x=[event_date],
+                y=[1.02],
+                mode='markers',
+                marker=dict(
+                    symbol='star',
+                    size=8,
+                    color='red',
+                ),
+                hoverinfo='text',
+                hovertext=f"⚡ {date}<br>{event}",
+                showlegend=False
+            ))
+
+        # Add single legend entry for log events
+        fig.add_trace(go.Scatter(
+            x=[None],
+            y=[None],
+            mode='lines',
+            line=dict(
+                color="rgba(255, 0, 0, 0.5)",
+                width=2,
+                dash="dot"
+            ),
+            name="Log Events ⚡",
+            showlegend=True
+        ))
+
         # Process each channel
         for ch in (selected_channels if isinstance(selected_channels, list) else [selected_channels]):
             col_name = f'{ch}{selected_sensor}'
             if col_name in final_df.columns:
-                # First, calculate daily means to reduce noise
-                daily_data = final_df.set_index('time')[col_name].resample('D').mean()
+                # Create a copy of the data for processing
+                working_df = final_df.copy()
                 
-                # Then apply the moving average to the daily data
+                # Apply baseline adjustment if selected (before transformation)
+                if baseline_type == 'adjusted':
+                    working_df, adjustments = apply_baseline_adjustment(working_df)
+                    print(f"Applied baseline adjustment for {col_name}: {adjustments}")
+                
+                # Apply data transformation if selected
+                if transform_type != 'none':
+                    working_df, transform_description = apply_transformation(
+                        working_df, 
+                        transform_type, 
+                        [col_name]
+                    )
+                
+                # Calculate daily means using processed data
+                daily_data = working_df.set_index('time')[col_name].resample('D').mean()
+                
+                # Apply moving average
                 ma_data = daily_data.rolling(window=ma_days, min_periods=1).mean()
                 
                 if not ma_data.empty:
-                    # Add the raw moving average line (lighter, with markers)
+                    # Add the raw moving average line
                     fig.add_trace(go.Scatter(
                         x=ma_data.index,
                         y=ma_data.values,
@@ -606,20 +787,17 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
                         opacity=0.7
                     ))
                     
-                    # Apply sigma filter and smoothing to the MA data
+                    # Apply sigma filter and smoothing
                     try:
-                        # Create a temporary dataframe with the MA data
                         temp_df = pd.DataFrame({'value': ma_data.values}, index=ma_data.index)
-                        
-                        # Apply sigma filter and smoothing
                         filtered_series, smoothed_series = apply_sigma_filter_and_smooth(
                             temp_df, 'value', 
-                            sigma_threshold=2.0,  # 2 standard deviations
-                            window_size=15,       # 15-day window for smoothing
-                            poly_order=3          # 3rd order polynomial
+                            sigma_threshold=2.0,
+                            window_size=15,
+                            poly_order=3
                         )
                         
-                        # Add the filtered data (optional)
+                        # Add filtered and smoothed data traces
                         fig.add_trace(go.Scatter(
                             x=ma_data.index,
                             y=filtered_series.values,
@@ -629,7 +807,6 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
                             opacity=0.5
                         ))
                         
-                        # Add the smoothed curve (thicker, no markers)
                         fig.add_trace(go.Scatter(
                             x=ma_data.index,
                             y=smoothed_series.values,
@@ -640,70 +817,83 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
                         ))
                     except Exception as e:
                         print(f"Error creating smoothed curve: {str(e)}")
-        
-        # Add period markers
-        for period_name, (start_date, end_date) in COMPARISON_PERIODS.items():
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
-            
-            # Add vertical lines at period boundaries
-            fig.add_vline(x=start_dt, line_dash="dash", line_color="gray", opacity=0.7)
-            fig.add_vline(x=end_dt, line_dash="dash", line_color="gray", opacity=0.7)
-            
-            # Add period annotation
-            fig.add_annotation(
-                x=(start_dt + (end_dt - start_dt)/2),
-                y=1.05,
-                text=period_name,
-                showarrow=False,
-                xref="x",
-                yref="paper",
-                font=dict(size=12, color="black"),
-                bgcolor="rgba(255, 255, 255, 0.8)",
-                bordercolor="gray",
-                borderwidth=1
-            )
-            
-            # Add shaded area for period
-            fig.add_shape(
-                type="rect",
-                x0=start_dt,
-                x1=end_dt,
-                y0=0,
-                y1=1,
-                xref="x",
-                yref="paper",
-                fillcolor="gray",
-                opacity=0.1,
-                layer="below",
-                line_width=0,
-            )
-        
-        # Update layout
-        title_text = f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor} (Baseline Adjusted)'
+
+        # Update layout with transformation and baseline information
+        transform_text = f"Transform: {transform_type.replace('_', ' ').title()}" if transform_type != 'none' else "No Transform"
+        baseline_text = "Baseline Adjusted" if baseline_type == 'adjusted' else "Raw Data"
+        title_text = f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor}'
         rpm_text = f"RPM Range: {rpm_min}-{rpm_max}"
             
         fig.update_layout(
-            title=title_text,
+            title=dict(
+                text=title_text,
+                y=0.98,  # Moved title even higher (was 0.95)
+                x=0.5,
+                xanchor='center',
+                yanchor='top',
+                font=dict(size=20)
+            ),
             xaxis_title='Time',
             yaxis_title=f'{selected_metric.replace("_", " ").title()} Value',
-            yaxis=dict(range=[y_min, y_max]),
+            yaxis=dict(
+                range=[y_min, y_max],
+                gridcolor='rgba(128, 128, 128, 0.2)',  # Light gray grid
+                zerolinecolor='rgba(128, 128, 128, 0.5)'  # Darker zero line
+            ),
+            xaxis=dict(
+                gridcolor='rgba(128, 128, 128, 0.2)',
+                showgrid=True,
+                rangeslider=dict(
+                    visible=False,
+                    thickness=0.1,  # Make the rangeslider thinner (default is 0.15)
+                    bgcolor='rgba(211, 211, 211, 0.5)'  # Lighter background
+                ),
+                rangeselector=dict(
+                    buttons=list([
+                        dict(count=7, label="1w", step="day", stepmode="backward"),
+                        dict(count=1, label="1m", step="month", stepmode="backward"),
+                        dict(count=3, label="3m", step="month", stepmode="backward"),
+                        dict(count=6, label="6m", step="month", stepmode="backward"),
+                        dict(step="all", label="All")
+                    ])
+                )
+            ),
+            plot_bgcolor='white',
             height=600,
             legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1
+                orientation="v",  # Changed to vertical orientation
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.02,  # Move legend outside to the right
+                bgcolor="rgba(255, 255, 255, 0.8)",  # Semi-transparent white background
+                bordercolor="rgba(128, 128, 128, 0.2)",
+                borderwidth=1
             ),
-            margin=dict(b=100)  # Add bottom margin for annotation
+            margin=dict(
+                b=80,   # Reduced bottom margin (was 100)
+                t=150,  # Increased top margin (was 120)
+                l=50,
+                r=150
+            ),
         )
         
-        # Add note about data processing
+        # Add legend for periods
+        for (period_name, _), color in zip(COMPARISON_PERIODS.items(), colors):
+            fig.add_trace(go.Scatter(
+                x=[None],
+                y=[None],
+                mode='markers',
+                marker=dict(size=10, color=color.replace('0.2', '1.0')),
+                name=period_name,
+                showlegend=True
+            ))
+
+        # Move the processing information annotation up slightly
         fig.add_annotation(
-            text=f"Baseline Adjusted | {rpm_text} | Sigma-filtered (2σ) with Savitzky-Golay smoothing",
+            text=f"{transform_text} | {baseline_text} | {rpm_text} | Sigma-filtered (2σ) with Savitzky-Golay smoothing",
             xref="paper", yref="paper",
-            x=0.5, y=-0.15,
+            x=0.5, y=-0.12,  # Moved up slightly (was -0.15)
             showarrow=False,
             font=dict(size=10),
             bgcolor="rgba(255, 240, 220, 0.8)",
@@ -714,7 +904,7 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
         return fig, "Data processed successfully"
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error updating visualization: {str(e)}")
         empty_fig = go.Figure()
         empty_fig.update_layout(
             title="Error",
@@ -727,39 +917,57 @@ def update_graph(selected_metric, selected_sensor, selected_channels, rpm_range,
                 y=0.5
             )]
         )
-        return empty_fig, f"Error: {str(e)}"   
+        return empty_fig, f"Error: {str(e)}"
 
 @app.callback(
     [Output('y-min-input', 'value'),
      Output('y-max-input', 'value')],
-    [Input('auto-scale-button', 'n_clicks')],
-    [State('metric-dropdown', 'value'),
-     State('sensor-dropdown', 'value'),
-     State('channel-dropdown', 'value')]
+    [Input('auto-scale-button', 'n_clicks'),
+     Input('loaded-data-store', 'data')],
+    [State('sensor-dropdown', 'value'),
+     State('channel-dropdown', 'value'),
+     State('transform-dropdown', 'value'),
+     State('baseline-radio', 'value')]
 )
-def update_y_axis_range(n_clicks, metric, sensor, channels):
-    if n_clicks == 0:
+def update_y_axis_range(n_clicks, stored_data, sensor, channels, transform_type, baseline_type):
+    if n_clicks == 0 or not stored_data:
         raise PreventUpdate
     
     try:
-        # Load data
-        df1, _ = load_data_cached(metric)
+        # Reconstruct dataframe from stored data
+        df1 = pd.DataFrame.from_records(stored_data['df1'], columns=stored_data['columns1'])
         
-        # Calculate y limits
-        y_min, y_max = calculate_y_limits(df1, channels, [sensor])
+        # Create working copy
+        working_df = df1.copy()
+        
+        # Apply baseline adjustment if selected
+        if baseline_type == 'adjusted':
+            working_df, _ = apply_baseline_adjustment(working_df)
+        
+        # Apply transformation if selected
+        if transform_type != 'none':
+            # Get columns to transform
+            columns_to_transform = [f'{ch}{sensor}' for ch in channels]
+            working_df, _ = apply_transformation(working_df, transform_type, columns_to_transform)
+        
+        # Calculate y limits using transformed data
+        y_min, y_max = calculate_y_limits(working_df, channels, [sensor])
         
         # Add some padding
         y_range = y_max - y_min
         y_min = y_min - 0.05 * y_range
         y_max = y_max + 0.05 * y_range
         
+        print(f"Auto-scaled y-axis: {y_min:.2f} to {y_max:.2f} (transform: {transform_type}, baseline: {baseline_type})")
         return y_min, y_max
-    except:
+        
+    except Exception as e:
+        print(f"Error in auto-scaling: {str(e)}")
         return None, None
 
 if __name__ == "__main__":
     # Get port from environment variable or use default
-    port = int(os.environ.get('PORT', 8056))
+    port = int(os.environ.get('PORT', 8057))
     
     # Get host from environment variable or use default
     host = os.environ.get('HOST', '0.0.0.0')
