@@ -372,8 +372,13 @@ def apply_baseline_adjustment(df, time_col='time'):
     return adjusted_df, adjustments
 
 # Initialize Dash app
-app = dash.Dash(__name__)
-server = app.server  # Add this line to expose the Flask server
+app = dash.Dash(__name__, 
+    external_stylesheets=[
+        # Remove any external stylesheets if not needed
+    ],
+    assets_folder='assets'  # Make sure this points to the correct assets directory
+)
+server = app.server  # This line is crucial for Render deployment
 
 # Load initial data
 try:
@@ -976,5 +981,5 @@ if __name__ == "__main__":
     app.run_server(
         host=host,
         port=port,
-        debug=True
+        debug=False  # Set debug to False for production
     )
