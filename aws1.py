@@ -49,7 +49,7 @@ TRANSFORMATIONS = [
 
 # S3 configuration
 S3_BUCKET = "public-tarucca-db"
-S3_KEY = "text.db"
+S3_KEY = "filtered_text.db"
 
 # Add this to your constants section at the top
 LOG_EVENTS = {
@@ -89,27 +89,27 @@ def get_db_file():
         print(f"Error downloading database from S3: {str(e)}")
         raise
 
-# Add caching decorator to load_data function
-@lru_cache(maxsize=1)
-def load_data_cached(metric, start_date="2024-04-01"):
+# First, modify the caching decorator to include more parameters
+@lru_cache(maxsize=32)  # Increased cache size
+def load_data_cached(metric, start_date, end_date):
+    """Load data with better caching strategy"""
     try:
         start_time = time.time()
-        print(f"Starting data load for {metric} from {start_date}...")
+        print(f"Starting data load for {metric} from {start_date} to {end_date}...")
         
-        # Get database file from S3
-        db_path = get_db_file()
+        # Use global variable to store db_path
+        global db_path
+        if not hasattr(load_data_cached, 'db_path'):
+            db_path = get_db_file()
+            load_data_cached.db_path = db_path
         
         # Create connection and read data efficiently
         with sqlite3.connect(db_path) as conn:
-            # First, get the column names from the metric table
-            columns_df = pd.read_sql(f"PRAGMA table_info({metric})", conn)
-            metric_columns = columns_df['name'].tolist()
-            
-            # Read data with date filter
+            # Read data with date range filter
             df = pd.read_sql(
-                'SELECT id, time FROM main_data WHERE time >= ?',
+                'SELECT id, time FROM main_data WHERE time >= ? AND time <= ?',
                 conn,
-                params=(start_date,),
+                params=(start_date, end_date),
                 parse_dates=['time']
             )
             
@@ -155,7 +155,7 @@ def load_data_cached(metric, start_date="2024-04-01"):
                 if col != 'id' and any(ch in col for ch in CHANNELS):
                     try:
                         # Try direct float conversion first
-                        df1[col] = pd.to_numeric(df1[col], errors='raise')
+                        df1[col] = pd.to_numeric(df1[col], errors='coerce')
                     except ValueError:
                         try:
                             # If that fails, try to extract 'magnitude' from JSON
@@ -166,6 +166,11 @@ def load_data_cached(metric, start_date="2024-04-01"):
                         except:
                             print(f"Warning: Could not process column {col}")
                             df1[col] = np.nan
+            
+            # Ensure all relevant columns are numeric before further processing
+            for col in df1.columns:
+                if col != 'id' and any(ch in col for ch in CHANNELS):
+                    df1[col] = pd.to_numeric(df1[col], errors='coerce')
             
             # Merge dataframes
             merged_df1 = pd.merge(
@@ -191,7 +196,7 @@ def load_data_cached(metric, start_date="2024-04-01"):
             return merged_df1, merged_df2
             
     except Exception as e:
-        print(f"Error loading data from local database: {str(e)}")
+        print(f"Error loading data: {str(e)}")
         raise
     
 # Calculate default y-limits
@@ -372,18 +377,48 @@ def apply_baseline_adjustment(df, time_col='time'):
     return adjusted_df, adjustments
 
 # Initialize Dash app
-app = dash.Dash(__name__, 
+app = dash.Dash(
+    __name__,
     external_stylesheets=[
-        # Remove any external stylesheets if not needed
+        'https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css'
     ],
-    assets_folder='assets'  # Make sure this points to the correct assets directory
+    external_scripts=[
+        'https://code.jquery.com/jquery-3.5.1.min.js',
+        'https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js',
+        'https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js'
+    ],
+    suppress_callback_exceptions=True,
+    assets_folder='assets'
 )
 server = app.server  # This line is crucial for Render deployment
+
+# Add meta tags for better mobile responsiveness
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>Sensor Data Analysis Dashboard</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        {%favicon%}
+        {%css%}
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 # Load initial data
 try:
     print("Loading initial data from local database...")
-    initial_df1, initial_df2 = load_data_cached('std_dev')
+    initial_df1, initial_df2 = load_data_cached('std_dev', '2024-06-01', '2024-11-30')
     y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
     # print(f"Initial data loaded: {len(initial_df1)} rows")
 except Exception as e:
@@ -450,10 +485,14 @@ app.layout = html.Div([
             html.Label('Date Range'),
             dcc.DatePickerRange(
                 id='date-picker',
-                min_date_allowed=datetime(2023, 8, 1),  # Or your earliest data date
+                min_date_allowed=datetime(2023, 8, 1),
                 max_date_allowed=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date(),
-                start_date=datetime(2024, 4, 1).date(),  # Set initial view to April 2024
-                end_date=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date()
+                start_date=datetime(2024, 4, 1).date(),
+                end_date=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date(),
+                display_format='YYYY-MM-DD',
+                first_day_of_week=1,  # Monday
+                persistence=True,
+                persistence_type='session'
             ),
         ], style={'width': '45%', 'padding': '10px'}),
     ], style={'display': 'flex', 'justifyContent': 'space-between'}),
@@ -502,6 +541,47 @@ app.layout = html.Div([
         html.Button('Auto Scale', id='auto-scale-button', n_clicks=0),
     ], style={'padding': '10px'}),
     
+    html.Div([
+        html.Div([
+            html.Label('Custom Period Selection (Max 2 periods)'),
+            dcc.DatePickerRange(
+                id='period-picker',
+                min_date_allowed=datetime(2024, 4, 1),
+                max_date_allowed=datetime(2024, 11, 30),
+                start_date=None,
+                end_date=None,
+                display_format='YYYY-MM-DD'
+            ),
+            html.Button(
+                'Add Period', 
+                id='add-period-button', 
+                n_clicks=0,
+                style={'marginLeft': '10px'}
+            ),
+        ], style={'width': '45%', 'padding': '10px'}),
+        
+        html.Div([
+            html.Label('Selected Periods for Comparison'),
+            dcc.Dropdown(
+                id='selected-periods-dropdown',
+                options=[],
+                value=[],
+                multi=True,
+                placeholder='Select 1-2 periods to compare'
+            ),
+            html.Button(
+                'Clear Periods', 
+                id='clear-periods-button', 
+                n_clicks=0,
+                style={'marginLeft': '10px'}
+            ),
+            html.Div(
+                id='period-selection-warning',
+                style={'color': 'red', 'marginTop': '5px', 'fontSize': '12px'}
+            ),
+        ], style={'width': '45%', 'padding': '10px'}),
+    ], style={'display': 'flex', 'justifyContent': 'space-between'}),
+    
     dcc.Loading(
         id="loading-spinner",
         type="circle",
@@ -530,50 +610,55 @@ app.layout = html.Div([
             'fontSize': '18px',
             'color': '#666'
         }
-    )
+    ),
+    
+    # Add a new graph for period comparison
+    html.Div([
+        dcc.Graph(id='period-comparison-graph')
+    ], style={'padding': '10px', 'marginTop': '20px'}),
+    
+    # Add a Store component to keep track of custom periods
+    dcc.Store(id='custom-periods-store'),
 ])
 
-# Add a new function to load full date range data
-def load_full_data(metric, start_date=None):
-    """Load data for a specific date range, bypassing the cache if needed"""
-    if start_date is None or start_date >= "2024-04-01":
-        return load_data_cached(metric)
-    else:
-        # Clear the cache if we need older data
-        load_data_cached.cache_clear()
-        return load_data_cached(metric, start_date)
-
+# Modify the load_and_store_data callback
 @app.callback(
     Output('loaded-data-store', 'data'),
     [Input('metric-dropdown', 'value'),
-     Input('date-picker', 'start_date')]
+     Input('date-picker', 'start_date'),
+     Input('date-picker', 'end_date')]
 )
-def load_and_store_data(selected_metric, start_date):
+def load_and_store_data(selected_metric, start_date, end_date):
     """Load data and store it in the browser"""
-    if not selected_metric:
+    if not all([selected_metric, start_date, end_date]):
         raise PreventUpdate
         
     try:
-        # Load data based on selected date range
+        # Convert dates to datetime
         start_dt = pd.to_datetime(start_date)
-        if start_dt.strftime('%Y-%m-%d') < "2024-04-01":
-            merged_df1, merged_df2 = load_full_data(selected_metric, start_dt.strftime('%Y-%m-%d'))
-            print(f"Loading full data range from {start_dt}")
-        else:
-            merged_df1, merged_df2 = load_data_cached(selected_metric)
-            print(f"Using cached data from April 2024")
-            
-        # Convert to dictionary for storage
+        end_dt = pd.to_datetime(end_date)
+        
+        # Load data
+        merged_df1, merged_df2 = load_data_cached(
+            selected_metric,
+            start_dt.strftime('%Y-%m-%d'),
+            end_dt.strftime('%Y-%m-%d')
+        )
+        
+        # Store the transformation state
         return {
             'df1': merged_df1.to_dict('records'),
             'df2': merged_df2.to_dict('records'),
             'columns1': merged_df1.columns.tolist(),
-            'columns2': merged_df2.columns.tolist()
+            'columns2': merged_df2.columns.tolist(),
+            'last_transform': None,  # Reset transformation state
+            'last_baseline': None    # Reset baseline state
         }
     except Exception as e:
         print(f"Error loading data: {str(e)}")
         return None
 
+# Update the update_graph callback to handle transformations properly
 @app.callback(
     [Output('sensor-graph', 'figure'),
      Output('loading-output', 'children')],
@@ -604,29 +689,29 @@ def update_graph(stored_data, selected_metric, selected_sensor, selected_channel
         merged_df1['time'] = pd.to_datetime(merged_df1['time'])
         merged_df2['time'] = pd.to_datetime(merged_df2['time'])
         
-        end_dt = pd.to_datetime(end_date).date()
+        # Create a deep copy for transformations
+        working_df = merged_df1.copy(deep=True)
         
-        # Filter by date efficiently
-        mask = merged_df1['time'].dt.date <= end_dt
-        df_filtered = merged_df1.loc[mask].copy()
-        
-        # Filter by RPM range efficiently
-        rpm_min, rpm_max = rpm_range
-        rpm_mask = (merged_df2['ch1s1'] >= rpm_min) & \
-                  (merged_df2['ch1s1'] < rpm_max)
-        rpm_filtered = merged_df2.loc[rpm_mask, ['id', 'time']]
-        
-        # Merge filtered data
-        final_df = pd.merge(
-            df_filtered, 
-            rpm_filtered, 
-            on=['id', 'time'],
-            how='inner'
-        )
-        
-        # Sort by time for proper processing
-        final_df = final_df.sort_values('time')
-        
+        # Process each channel independently
+        for ch in (selected_channels if isinstance(selected_channels, list) else [selected_channels]):
+            col_name = f'{ch}{selected_sensor}'
+            if col_name in working_df.columns:
+                # Apply baseline adjustment if selected
+                if baseline_type == 'adjusted':
+                    channel_df = working_df[[col_name, 'time']].copy()
+                    channel_df, _ = apply_baseline_adjustment(channel_df)
+                    working_df[col_name] = channel_df[col_name]
+                
+                # Apply transformation if selected
+                if transform_type != 'none':
+                    channel_df = working_df[[col_name]].copy()
+                    transformed_df, _ = apply_transformation(
+                        channel_df,
+                        transform_type,
+                        [col_name]
+                    )
+                    working_df[col_name] = transformed_df[col_name]
+
         # Create figure
         fig = go.Figure()
         
@@ -757,23 +842,7 @@ def update_graph(stored_data, selected_metric, selected_sensor, selected_channel
         # Process each channel
         for ch in (selected_channels if isinstance(selected_channels, list) else [selected_channels]):
             col_name = f'{ch}{selected_sensor}'
-            if col_name in final_df.columns:
-                # Create a copy of the data for processing
-                working_df = final_df.copy()
-                
-                # Apply baseline adjustment if selected (before transformation)
-                if baseline_type == 'adjusted':
-                    working_df, adjustments = apply_baseline_adjustment(working_df)
-                    print(f"Applied baseline adjustment for {col_name}: {adjustments}")
-                
-                # Apply data transformation if selected
-                if transform_type != 'none':
-                    working_df, transform_description = apply_transformation(
-                        working_df, 
-                        transform_type, 
-                        [col_name]
-                    )
-                
+            if col_name in working_df.columns:
                 # Calculate daily means using processed data
                 daily_data = working_df.set_index('time')[col_name].resample('D').mean()
                 
@@ -827,7 +896,7 @@ def update_graph(stored_data, selected_metric, selected_sensor, selected_channel
         transform_text = f"Transform: {transform_type.replace('_', ' ').title()}" if transform_type != 'none' else "No Transform"
         baseline_text = "Baseline Adjusted" if baseline_type == 'adjusted' else "Raw Data"
         title_text = f'{selected_metric.replace("_", " ").title()} - Sensor {selected_sensor}'
-        rpm_text = f"RPM Range: {rpm_min}-{rpm_max}"
+        rpm_text = f"RPM Range: {rpm_range[0]}-{rpm_range[1]}"
             
         fig.update_layout(
             title=dict(
@@ -969,6 +1038,231 @@ def update_y_axis_range(n_clicks, stored_data, sensor, channels, transform_type,
     except Exception as e:
         print(f"Error in auto-scaling: {str(e)}")
         return None, None
+
+# Update the callback to manage custom periods
+@app.callback(
+    [Output('custom-periods-store', 'data'),
+     Output('selected-periods-dropdown', 'options'),
+     Output('selected-periods-dropdown', 'value'),
+     Output('period-selection-warning', 'children')],
+    [Input('add-period-button', 'n_clicks'),
+     Input('clear-periods-button', 'n_clicks')],
+    [State('period-picker', 'start_date'),
+     State('period-picker', 'end_date'),
+     State('custom-periods-store', 'data'),
+     State('selected-periods-dropdown', 'value')]
+)
+def manage_custom_periods(add_clicks, clear_clicks, start_date, end_date, stored_periods, selected_values):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+        
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    warning_message = ""
+    
+    if triggered_id == 'clear-periods-button':
+        return None, [], [], ""
+        
+    if triggered_id == 'add-period-button' and start_date and end_date:
+        if not stored_periods:
+            stored_periods = {}
+            
+        # Check if we already have 2 periods
+        if len(stored_periods) >= 2:
+            warning_message = "Maximum 2 periods allowed. Please clear existing periods first."
+            options = [{'label': name, 'value': name} for name in stored_periods.keys()]
+            return stored_periods, options, selected_values, warning_message
+            
+        # Add new period
+        period_name = f"Period {len(stored_periods) + 1}: {start_date} to {end_date}"
+        stored_periods[period_name] = [start_date, end_date]
+        
+        options = [{'label': name, 'value': name} for name in stored_periods.keys()]
+        
+        # Automatically select the new period if we have 2 or fewer
+        if len(stored_periods) <= 2:
+            selected_values = list(stored_periods.keys())
+        
+        return stored_periods, options, selected_values, warning_message
+        
+    raise PreventUpdate
+
+# Update the period comparison callback to handle exactly two periods
+@app.callback(
+    Output('period-comparison-graph', 'figure'),
+    [Input('selected-periods-dropdown', 'value'),
+     Input('loaded-data-store', 'data'),
+     Input('sensor-dropdown', 'value'),
+     Input('channel-dropdown', 'value'),
+     Input('transform-dropdown', 'value'),
+     Input('baseline-radio', 'value'),
+     Input('ma-slider', 'value')],
+    [State('custom-periods-store', 'data')]
+)
+def update_period_comparison(selected_periods, stored_data, selected_sensor, selected_channels,
+                           transform_type, baseline_type, ma_days, custom_periods):
+    if not all([stored_data, custom_periods, selected_sensor, selected_channels]) or len(selected_periods) < 1:
+        return go.Figure()
+        
+    try:
+        # Create figure for period comparison
+        fig = go.Figure()
+        
+        # Reconstruct dataframes from stored data
+        merged_df1 = pd.DataFrame.from_records(stored_data['df1'], columns=stored_data['columns1'])
+        merged_df1['time'] = pd.to_datetime(merged_df1['time'])
+        
+        # Process data for each selected period
+        for i, period_name in enumerate(selected_periods[:2]):  # Limit to first two periods
+            start_date, end_date = custom_periods[period_name]
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            
+            # Filter data for this period
+            period_data = merged_df1[
+                (merged_df1['time'] >= start_dt) & 
+                (merged_df1['time'] <= end_dt)
+            ].copy()
+            
+            if period_data.empty:
+                print(f"No data found for period {period_name}")
+                continue
+                
+            # Process each channel
+            for ch in (selected_channels if isinstance(selected_channels, list) else [selected_channels]):
+                col_name = f'{ch}{selected_sensor}'
+                if col_name in period_data.columns:
+                    # Create a working copy for transformations
+                    working_data = period_data.copy()
+                    
+                    # Apply baseline adjustment if selected
+                    if baseline_type == 'adjusted':
+                        working_data, _ = apply_baseline_adjustment(working_data)
+                    
+                    # Apply transformation if selected
+                    if transform_type != 'none':
+                        working_data, _ = apply_transformation(
+                            working_data,
+                            transform_type,
+                            [col_name]
+                        )
+                    
+                    # Calculate average value for the period
+                    avg_value = working_data[col_name].mean()
+                    print(f"Average value for {period_name} - {ch}: {avg_value:.3f}")
+                    
+                    # Normalize time to start from day 0
+                    working_data['days'] = (working_data['time'] - working_data['time'].min()).dt.total_seconds() / (24 * 3600)
+                    
+                    # Calculate daily means
+                    daily_data = working_data.groupby('days')[col_name].mean()
+                    
+                    # Apply moving average
+                    ma_data = daily_data.rolling(window=ma_days, min_periods=1).mean()
+                    
+                    # Apply sigma filter and smoothing for trend
+                    temp_df = pd.DataFrame({'value': ma_data.values}, index=ma_data.index)
+                    filtered_series, smoothed_series = apply_sigma_filter_and_smooth(
+                        temp_df, 'value',
+                        sigma_threshold=2.0,
+                        window_size=15,
+                        poly_order=3
+                    )
+                    
+                    # Add raw data trace with distinctive styling
+                    line_style = 'solid' if i == 0 else 'dash'
+                    period_num = i + 1
+                    
+                    # Add moving average trace
+                    fig.add_trace(go.Scatter(
+                        x=ma_data.index,
+                        y=ma_data.values,
+                        mode='lines',
+                        name=f'Period {period_num}: {start_date} to {end_date} - {ch} (MA)',
+                        line=dict(
+                            color=COLORS[ch],
+                            width=1,
+                            dash=line_style
+                        ),
+                        opacity=0.3
+                    ))
+                    
+                    # Add smoothed trend
+                    fig.add_trace(go.Scatter(
+                        x=ma_data.index,
+                        y=smoothed_series.values,
+                        mode='lines',
+                        name=f'Period {period_num}: {ch} (Trend)',
+                        line=dict(
+                            color=COLORS[ch],
+                            width=3,
+                            dash=line_style
+                        ),
+                        opacity=1.0
+                    ))
+                    
+                    # Add horizontal line for average
+                    fig.add_shape(
+                        type="line",
+                        x0=ma_data.index.min(),
+                        x1=ma_data.index.max(),
+                        y0=avg_value,
+                        y1=avg_value,
+                        line=dict(
+                            color=COLORS[ch],
+                            width=1,
+                            dash="dot"
+                        ),
+                        opacity=0.5
+                    )
+                    
+                    # Add annotation for average value
+                    fig.add_annotation(
+                        x=ma_data.index.max(),
+                        y=avg_value,
+                        text=f"Avg: {avg_value:.3f}",
+                        showarrow=False,
+                        xanchor="left",
+                        yanchor="bottom",
+                        xshift=10,
+                        font=dict(
+                            color=COLORS[ch],
+                            size=10
+                        )
+                    )
+                    
+                    print(f"Added traces for {period_name} - {ch} with {len(ma_data)} points")
+        
+        # Update layout
+        fig.update_layout(
+            title=dict(
+                text='Period Comparison (Aligned from Day 0)',
+                y=0.95
+            ),
+            xaxis_title='Days from Period Start',
+            yaxis_title='Value',
+            showlegend=True,
+            legend=dict(
+                orientation="v",
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.02,
+                bgcolor="rgba(255, 255, 255, 0.8)",
+                bordercolor="rgba(128, 128, 128, 0.2)",
+                borderwidth=1
+            ),
+            margin=dict(r=150, t=50),
+            plot_bgcolor='white',
+            height=400,
+            hovermode='x unified'
+        )
+        
+        return fig
+        
+    except Exception as e:
+        print(f"Error updating period comparison: {str(e)}")
+        return go.Figure()
 
 if __name__ == "__main__":
     # Get port from environment variable or use default
