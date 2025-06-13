@@ -49,7 +49,7 @@ TRANSFORMATIONS = [
 
 # S3 configuration
 S3_BUCKET = "public-tarucca-db"
-S3_KEY = "meta_data.db"
+S3_KEY = "meta_data_may2025.db"
 
 # Add this to your constants section at the top
 LOG_EVENTS = {
