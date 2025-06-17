@@ -418,7 +418,7 @@ app.index_string = '''
 # Load initial data
 try:
     print("Loading initial data from local database...")
-    initial_df1, initial_df2 = load_data_cached('std_dev', '2024-06-01', '2024-11-30')
+    initial_df1, initial_df2 = load_data_cached('std_dev', '2022-01-01', '2026-11-30')
     y_min, y_max = calculate_y_limits(initial_df1, CHANNELS, SENSORS)
     # print(f"Initial data loaded: {len(initial_df1)} rows")
 except Exception as e:
