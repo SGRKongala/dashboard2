@@ -485,9 +485,9 @@ app.layout = html.Div([
             html.Label('Date Range'),
             dcc.DatePickerRange(
                 id='date-picker',
-                min_date_allowed=datetime(2023, 8, 1),
+                min_date_allowed=datetime(2023, 1, 1),
                 max_date_allowed=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date(),
-                start_date=datetime(2024, 4, 1).date(),
+                start_date=datetime(2026, 12, 31).date(),
                 end_date=initial_df1['time'].max().date() if not initial_df1.empty else datetime.now().date(),
                 display_format='YYYY-MM-DD',
                 first_day_of_week=1,  # Monday
@@ -546,8 +546,8 @@ app.layout = html.Div([
             html.Label('Custom Period Selection (Max 2 periods)'),
             dcc.DatePickerRange(
                 id='period-picker',
-                min_date_allowed=datetime(2024, 4, 1),
-                max_date_allowed=datetime(2024, 11, 30),
+                min_date_allowed=datetime(2023, 1, 1),
+                max_date_allowed=datetime(2026, 12, 31),
                 start_date=None,
                 end_date=None,
                 display_format='YYYY-MM-DD'
